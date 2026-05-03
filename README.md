@@ -1,5 +1,6 @@
 # Reinforcement-Learning-Project-25-26
 
+## PASSO A PASSO PARA TRABALHAR COM O GIT E O VS CODE
 PASSO 1: Antes de começares a trabalhar vê em que branch estás:
 
 git branch
