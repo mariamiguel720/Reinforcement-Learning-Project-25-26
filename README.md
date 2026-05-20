@@ -17,12 +17,18 @@ Agora estás pronto para trabalhar à vontade
 
 PASSO 3: Quando acabares o trabalho
 
-git add . git commit -m "mensagem explicativa do commit" git push origin nome-do-teu-branch
+git add . 
+
+git commit -m "mensagem explicativa do commit" 
+
+git push origin nome-do-teu-branch
 
 PASSO 4: Atualizar o branch comum
 
 git checkout nome-branch-comum
+
 git pull origin nome-branch-comum
+
 git merge nome-do-teu-branch git push nome-branch-comum
 
 PASSO 5: Voltar ao branch pessoal
