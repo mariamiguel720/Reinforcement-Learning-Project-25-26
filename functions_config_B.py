@@ -1,5 +1,38 @@
-# Function to use in Config B
+# FUNCTION CONFIG_B 
 
+# Import necessary libraries
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import random
+from collections import deque
+import matplotlib.pyplot as plt
+
+# Device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# Project modules
+from envs.env_setup import (
+    ENV_ID, N_STATES, N_ACTIONS, STATE_SURVIVED, STATE_DIED,
+    GAMMA, INTENSITY, SOFA_BIAS, LAM,
+    make_sepsis_env,
+)
+from envs.continuous_sepsis_env import ContinuousICUSepsisEnv, FEATURE_NAMES
+from envs.wrappers import (
+    EpisodicNoisyObsEnv, EpisodicMissingObsEnv,
+    AcuteEventEnv, make_clinical_env
+)
+
+# Config B constants
+OBS_DIM = 47   # 47 physiological features
+
+
+SEED = 42
+
+
+# Run random policy rollouts to collect episode statistics and trajectories for offline analysis and DQN pretraining.
 def rollout(env, n_episodes: int, seed: int = SEED):
     """Run n_episodes with a random policy. Return a list of episode dicts."""
     rng = np.random.default_rng(seed)
@@ -26,6 +59,7 @@ def rollout(env, n_episodes: int, seed: int = SEED):
     return records
 
 
+# DQN - Network and Replay Buffer
 class QNetwork(nn.Module):
     """
     Q-value approximator: Q(s, a) for all 25 actions simultaneously.
@@ -75,10 +109,20 @@ class ReplayBuffer:
         return len(self.buffer)
     
 
-#  DQN — Evaluation
+# EVALUATION FUNCTION 
 
-def evaluate_dqn(model, env_fn, n_episodes=1000, seed=SEED):
-    """Greedy evaluation of DQN policy on the clinical environment."""
+N_EPISODES = 1000
+clinical_env = make_clinical_env()
+records_clinical = rollout(clinical_env, N_EPISODES)
+clinical_env.close()
+
+df_clinical = pd.DataFrame([{k: v for k, v in r.items() if k != 'obs_traj'}
+                            for r in records_clinical])
+
+clinical_rand_mean = df_clinical['return'].mean()
+
+def evaluate(model, env_fn, n_episodes=1000, seed=SEED, is_ppo=False, label='Agent'):
+    """Greedy evaluation on the clinical environment. Works for DQN and PPO."""
     model.eval()
     np.random.seed(seed)
     returns, lengths = [], []
@@ -94,8 +138,12 @@ def evaluate_dqn(model, env_fn, n_episodes=1000, seed=SEED):
             ep_missing = info.get('missing_features') is not None
 
             while not done:
-                obs_t  = torch.FloatTensor(obs).unsqueeze(0).to(device)
-                action = int(model(obs_t).argmax(1).item())
+                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+                if is_ppo:
+                    logits, _ = model(obs_t)
+                    action = int(logits.argmax(1).item())
+                else:
+                    action = int(model(obs_t).argmax(1).item())
                 obs, r, te, tr, _ = env_eval.step(action)
                 total_r += r; steps += 1; done = te or tr
 
@@ -106,11 +154,11 @@ def evaluate_dqn(model, env_fn, n_episodes=1000, seed=SEED):
     env_eval.close()
     model.train()
 
-    returns = np.array(returns)
+    returns  = np.array(returns)
     survival = float(np.mean(returns > 0)) * 100
 
     print(f'═' * 52)
-    print(f'  DQN — Evaluation ({n_episodes} episodes)')
+    print(f'  {label} — Evaluation ({n_episodes} episodes)')
     print(f'═' * 52)
     print(f'  Overall survival rate  : {survival:.1f}%')
     print(f'  Mean return            : {np.mean(returns):.4f}')
@@ -124,3 +172,24 @@ def evaluate_dqn(model, env_fn, n_episodes=1000, seed=SEED):
 
     return returns, np.array(lengths), np.array(noisy_r), np.array(clean_r), \
            np.array(missing_r), np.array(nomiss_r)
+
+
+# PLOTTING FUNCTION
+def plot_learning_curve(returns, label, color, filename):
+    """Learning curve with smoothed returns and random baseline reference."""
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    window = 200
+    smoothed = pd.Series(returns).rolling(window).mean()
+
+    ax.plot(returns, alpha=0.15, color=color, linewidth=0.5)
+    ax.plot(smoothed, color=color, linewidth=2, label=f'Smoothed (window={window})')
+    ax.axhline(clinical_rand_mean, color='red', linestyle='--',
+               linewidth=1.5, label=f'Random baseline (~{clinical_rand_mean:.3f})')
+
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Return')
+    ax.set_title(f'{label} — Learning Curve', fontweight='bold')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
