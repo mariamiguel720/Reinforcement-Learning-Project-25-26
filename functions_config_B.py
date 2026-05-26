@@ -648,9 +648,6 @@ def train_a2c(
     torch.manual_seed(SEED + run_id)
     np.random.seed(SEED + run_id)
 
-    env   = make_clinical_env()
-    model = A2CNetwork(obs_dim=OBS_DIM, n_actions=N_ACTIONS).to(device)
-    opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
     all_returns   = []       # one entry per completed episode
     recent        = deque(maxlen=200)
