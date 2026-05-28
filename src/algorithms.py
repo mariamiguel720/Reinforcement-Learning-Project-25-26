@@ -584,6 +584,7 @@ class A2CNetwork(nn.Module):
 
 
 # A2C TRAINING FUNCTION
+# A2C TRAINING FUNCTION
 def train_a2c(
     run_id:      int   = 1,
     n_updates:   int   = 150,      # total number of gradient updates
@@ -593,6 +594,7 @@ def train_a2c(
     vf_coef:     float = 0.5,      # critic loss weight
     max_grad:    float = 0.5,      # gradient clipping norm
     log_every:   int   = 10,       # print progress every N updates
+    save_dir:    str   = 'models', # directory where weights and arrays are saved
 ) -> dict:
     """Train an A2C agent on the clinical ICU-Sepsis environment.
 
@@ -615,6 +617,10 @@ def train_a2c(
     torch.manual_seed(SEED + run_id)
     np.random.seed(SEED + run_id)
 
+    # Model, optimiser & environment
+    model = A2CNetwork().to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    env   = make_clinical_env()
 
     all_returns   = []       # one entry per completed episode
     recent        = deque(maxlen=200)
@@ -689,8 +695,8 @@ def train_a2c(
         # Normalise advantage (reduces variance, stabilises training)
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-        actor_loss  = -(log_prob_t * advantage).mean()
-        critic_loss = vf_coef  * (ret_t - val_t).pow(2).mean()
+        actor_loss   = -(log_prob_t * advantage).mean()
+        critic_loss  =  vf_coef  * (ret_t - val_t).pow(2).mean()
         entropy_loss = -ent_coef * entropy_t.mean()
 
         loss = actor_loss + critic_loss + entropy_loss
@@ -716,7 +722,14 @@ def train_a2c(
     print(f'  Training complete. Total episodes: {len(all_returns)}')
     print('─' * 52)
 
+    # Save weights and returns
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(model.state_dict(), f'{save_dir}/a2c_run{run_id}.pth')
+    np.save(f'{save_dir}/a2c_returns_run{run_id}.npy', np.array(all_returns))
+    print(f'  Saved → {save_dir}/a2c_run{run_id}.*')
+
     return {'model': model, 'returns': all_returns}
+
 
 
 # A2C GRID SEARCH FUNCTION
