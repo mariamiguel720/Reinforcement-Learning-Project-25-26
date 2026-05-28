@@ -922,17 +922,26 @@ def evaluate(model, env_fn, n_episodes=1000, seed=SEED, is_ppo=False, is_sac=Fal
 
 
 # PLOTTING FUNCTION
-def plot_learning_curve(returns, label, color, filename):
-    """Learning curve with smoothed returns and random baseline reference."""
+def plot_learning_curve(returns, label, color, filename, window=200, trend=True):
+    """Learning curve with smoothed returns and optional linear trend line."""
     fig, ax = plt.subplots(figsize=(12, 4))
 
-    window = 200
+    returns = np.asarray(returns)
     smoothed = pd.Series(returns).rolling(window).mean()
 
-    ax.plot(returns, alpha=0.15, color=color, linewidth=0.5)
     ax.plot(smoothed, color=color, linewidth=2, label=f'Smoothed (window={window})')
-    ax.axhline(clinical_rand_mean, color='red', linestyle='--',
-               linewidth=1.5, label=f'Random baseline (~{clinical_rand_mean:.3f})')
+
+    # Trend line
+    if trend:
+        x = np.arange(len(returns))
+        slope, intercept = np.polyfit(x, returns, 1)
+        ax.plot(x, slope * x + intercept, color='#0a1f35', linewidth=1.5,
+                linestyle='--', label=f'Trend (slope={slope:.2e})')
+
+    # Eixo y apertado a volta da curva suavizada (ignora NaNs iniciais da rolling)
+    valid = smoothed.dropna()
+    margin = (valid.max() - valid.min()) * 0.1
+    ax.set_ylim(valid.min() - margin, valid.max() + margin)
 
     ax.set_xlabel('Episode')
     ax.set_ylabel('Return')
