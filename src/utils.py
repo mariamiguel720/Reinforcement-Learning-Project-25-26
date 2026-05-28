@@ -123,7 +123,7 @@ def evaluate(model, env_fn, n_episodes=1000, seed=SEED, is_ppo=False, is_sac=Fal
 
 # PLOTTING FUNCTIONS
 
-def plot_learning_curve(returns, label, filename, window=200, trend=True):
+def plot_learning_curve(returns, label, window=200, trend=True):
     """Learning curve with smoothed returns and optional linear trend line."""
     fig, ax = plt.subplots(figsize=(12, 4))
 
@@ -162,7 +162,7 @@ def survival_ci(returns, confidence=0.95):
     return p * 100, lower, upper
 
 
-def plot_episode_type_comparison(noisy, clean, missing, label, filename):
+def plot_episode_type_comparison(noisy, clean, missing, label):
     """Bar chart comparing survival rates across clinical episode types."""
     groups = ['Clean\nepisodes', 'Noisy\nepisodes', 'Missing\nfeatures']
     data   = [clean, noisy, missing]

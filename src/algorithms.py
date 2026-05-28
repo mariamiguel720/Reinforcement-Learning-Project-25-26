@@ -334,15 +334,6 @@ class RolloutBuffer:
 
 
 
-#!!!!! PUS O CODIGO A SEGUIR EM COMENTÁRIO PQ ACHO QUE NÃO É PRECISO TERMOS ISTO AQUI
-""" # Architecture summary
-ppo_model = ActorCritic().to(device)
-n_params  = sum(p.numel() for p in ppo_model.parameters())
-print('ActorCritic architecture:')
-print(ppo_model)
-print(f'\nTotal parameters: {n_params:,}') """
-
-
 # GAE COMPUTATION FUNCTION
 def compute_gae(rewards, values, dones, lam=0.95):
     """
