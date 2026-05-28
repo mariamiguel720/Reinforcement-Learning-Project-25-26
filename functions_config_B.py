@@ -3,7 +3,6 @@
 # Import necessary libraries
 import pandas as pd
 import numpy as np
-from sympy import gamma
 import torch
 import torch.nn as nn
 import random
@@ -707,7 +706,7 @@ def train_a2c(
         returns = []
         R = last_val if not done_buf[-1] else 0.0
         for r, d in zip(reversed(rew_buf), reversed(done_buf)):
-            R = r + gamma * R * (1.0 - d)
+            R = r + GAMMA * R * (1.0 - d)
             returns.insert(0, R)
 
         # Gradient update
@@ -1084,7 +1083,7 @@ class SACCritic(nn.Module):
 # SAC UPDATE FUNCTION 
 def update_sac(actor, critic, critic_target,
                actor_optim, critic_optim,
-               buffer, batch_size, alpha, gamma, tau,
+               buffer, batch_size, alpha, tau,
                log_dict=None):
     """Single gradient step for SAC."""
     if len(buffer) < batch_size:
@@ -1102,7 +1101,7 @@ def update_sac(actor, critic, critic_target,
         next_probs, next_log_probs = actor(next_states_t)
         next_q   = critic_target(next_states_t)
         next_v   = (next_probs * (next_q - alpha * next_log_probs)).sum(dim=1)
-        target_q = rewards_t + gamma * (1 - dones_t) * next_v
+        target_q = rewards_t + GAMMA * (1 - dones_t) * next_v
 
     current_q   = critic(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
     critic_loss = F.mse_loss(current_q, target_q)
@@ -1146,7 +1145,6 @@ def train_sac(
     lr_critic:    float = 3e-4,
     alpha:        float = 0.2,           # entropy coefficient (fixed)
     tau:          float = 0.005,         # soft target update rate
-    gamma:        float = GAMMA,
     hidden:       int   = 256,
     save_dir:     str   = 'models',
     save_weights: bool  = True,
@@ -1207,7 +1205,7 @@ def train_sac(
             if len(buffer) >= min_buffer:
                 update_sac(actor, critic, critic_target,
                            actor_optim, critic_optim,
-                           buffer, batch_size, alpha, gamma, tau, log_dict=log_dict)
+                           buffer, batch_size, alpha, tau, log_dict=log_dict)
 
         all_returns.append(ep_return)
 
