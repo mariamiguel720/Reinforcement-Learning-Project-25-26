@@ -14,6 +14,7 @@ from torch.distributions import Categorical
 import itertools
 import random
 import copy
+import optuna
 
 # Device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -353,161 +354,184 @@ def compute_gae(rewards, values, dones, lam=0.95):
 
 
 
-def train_ppo(
-    run_id:      int   = 1,
-    n_updates:   int   = 100,
-    n_steps:     int   = 4096,
-    n_epochs:    int   = 10,
-    batch_size:  int   = 256,
-    lr:          float = 3e-4,
-    clip:        float = 0.2,
-    gae_lam:     float = 0.95,
-    ent_coef:    float = 0.01,
-    vf_coef:     float = 0.5,
-    max_grad:    float = 0.5,
-    save_dir:    str   = 'models',
+def train_ppo_optuna(
+    n_updates         = 150,
+    n_steps           = 4096,
+    n_epochs          = 10,
+    batch_size        = 256,
+    lr                = 1e-4,
+    clip              = 0.2,
+    gae_lam           = 0.95,
+    ent_coef          = 0.02,
+    vf_coef           = 0.5,
+    max_grad          = 0.5,
+    seed              = 42,
+    eval_every        = 25,       # evaluate every N updates
+    eval_episodes     = 100,      # 100 episodes: lower noise than 30
+    trial             = None,     # Optuna trial object; None = normal run
+    use_inner_pruning = False,    # only active for the first two seeds
+    save_dir          = None,     # None during tuning, path for final retrain
+    save_tag          = 'ppo',
 ):
     """
-    Train a PPO agent on the Config B clinical environment.
- 
-    Saves model weights and episode returns to `save_dir` at the end of
-    training so results survive session restarts.
- 
-    Parameters:
-        - run_id     : integer label used in saved file names
-                    (ppo_run{run_id}.pth, ppo_returns_run{run_id}.npy)
-        - n_updates  : total number of rollout/update cycles
-        - n_steps    : environment steps collected per rollout
-        - n_epochs   : gradient epochs per update (reuse of each rollout)
-        - batch_size : mini-batch size within each epoch
-        - lr         : Adam learning rate (eps fixed at 1e-5 as standard for PPO)
-        - clip       : PPO clipping epsilon
-        - gae_lam    : GAE lambda — controls bias/variance trade-off
-        - ent_coef   : entropy bonus coefficient (encourages exploration)
-        - vf_coef    : value function loss coefficient
-        - max_grad   : maximum L2 norm for gradient clipping
-        - save_dir   : directory where weights and arrays are saved
- 
-    Returns:
-        - dict with keys:
-            'model'       : trained ActorCritic (in eval mode)
-            'returns'     : list[float]  per-episode returns
-            'train_time'  : float        wall-clock training time in seconds
-            'run_id'      : int          the run_id passed in
+    PPO training function compatible with Optuna.
+
+    When `trial` is provided and `use_inner_pruning=True`, the function
+    reports the mean survival rate at each eval checkpoint to Optuna and
+    raises `TrialPruned` if the pruner decides to cut the trial early.
+
+    Returns a dict with:
+        'model'       : trained ActorCritic (eval mode)
+        'best_eval'   : best mean return seen during eval checkpoints
+        'best_state'  : state_dict of the best checkpoint (for final retrain)
+        'eval_history': list of (update_idx, mean_return) tuples
+        'returns'     : all per-episode returns during training
+        'duration_s'  : wall-clock seconds
     """
- 
-    # model & optimiser 
+    # Reproducibility
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
     model     = ActorCritic().to(device)
     optimiser = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     buffer    = RolloutBuffer()
- 
-    # training state
-    all_returns = []
-    t0          = time.time()
- 
-    env = make_clinical_env()
-    obs, _ = env.reset(seed=SEED)
- 
-    ep_return          = 0.0
-    current_ep_returns = []
- 
-    # main loop
+    # Initialise best_state to current weights so it is never None,
+    # even if the trial is pruned before the first eval checkpoint.
+    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    all_returns  = []
+    eval_history = []
+    best_eval    = -float('inf')
+    t0           = time.time()
+
+    env      = make_clinical_env()
+    env_eval = make_clinical_env()
+
+    obs, _    = env.reset(seed=int(rng.integers(1_000_000)))
+    ep_return = 0.0
+
     for update in range(n_updates):
- 
-        # Collect rollout
+
+        # --- Collect rollout ---
         buffer.clear()
- 
+        current_ep_returns = []
+
         for step in range(n_steps):
             obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
- 
             with torch.no_grad():
                 action, log_prob, value = model.get_action(obs_t)
- 
+
             next_obs, reward, te, tr, _ = env.step(action.item())
             done = te or tr
- 
+
             buffer.push(obs, action.item(), reward, float(done),
                         log_prob.item(), value)
- 
+
             ep_return += reward
             obs        = next_obs
- 
+
             if done:
                 all_returns.append(ep_return)
                 current_ep_returns.append(ep_return)
                 ep_return = 0.0
-                obs, _ = env.reset(seed=np.random.randint(100_000))
- 
-        # Compute advantages (GAE) and normalise
-        advantages  = compute_gae(buffer.rewards, buffer.values, buffer.dones, lam=gae_lam)
-        advantages  = torch.FloatTensor(advantages).to(device)
-        advantages  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
- 
-        returns_gae = advantages + torch.FloatTensor(
+                obs, _ = env.reset(seed=int(rng.integers(1_000_000)))
+
+        # --- Compute advantages (GAE) ---
+        advantages_raw = compute_gae(buffer.rewards, buffer.values, buffer.dones,
+                                     lam=gae_lam)
+        advantages_raw = torch.FloatTensor(advantages_raw).to(device)
+        # Critic targets: raw GAE + V(s)  — must be computed BEFORE normalisation
+        returns_gae    = advantages_raw + torch.FloatTensor(
             [v.item() for v in buffer.values]).to(device)
- 
-        # Convert buffer to tensors
+        # Normalise advantages for the actor loss only (reduces gradient variance)
+        advantages = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
+
         states_t  = torch.FloatTensor(np.array(buffer.states)).to(device)
         actions_t = torch.LongTensor(buffer.actions).to(device)
         old_lp_t  = torch.FloatTensor(buffer.log_probs).to(device)
- 
-        # PPO update — N epochs over the same rollout
+
+        # --- PPO update (n_epochs over same rollout) ---
         indices = np.arange(n_steps)
- 
         for epoch in range(n_epochs):
             np.random.shuffle(indices)
- 
-            for start in range(0, n_steps, batch_size):
+            # Stop before last incomplete mini-batch to avoid empty idx tensors
+            for start in range(0, n_steps - batch_size + 1, batch_size):
                 idx = indices[start:start + batch_size]
- 
-                log_prob, value, entropy = model.evaluate(states_t[idx], actions_t[idx])
- 
-                # Clipped surrogate objective
-                ratio        = torch.exp(log_prob - old_lp_t[idx])
-                surr1        = ratio * advantages[idx]
-                surr2        = torch.clamp(ratio, 1 - clip, 1 + clip) * advantages[idx]
-                actor_loss   = -torch.min(surr1, surr2).mean()
-                critic_loss  =  F.mse_loss(value, returns_gae[idx])
+
+                log_prob, value, entropy = model.evaluate(states_t[idx],
+                                                          actions_t[idx])
+                ratio      = torch.exp(log_prob - old_lp_t[idx])
+                surr1      = ratio * advantages[idx]
+                surr2      = torch.clamp(ratio, 1 - clip, 1 + clip) * advantages[idx]
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = F.mse_loss(value, returns_gae[idx])
                 entropy_loss = -entropy.mean()
- 
                 loss = actor_loss + vf_coef * critic_loss + ent_coef * entropy_loss
- 
+
                 optimiser.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
                 optimiser.step()
- 
-        # Progress
-        mean_ret           = np.mean(current_ep_returns) if current_ep_returns else 0.0
-        current_ep_returns = []
-        print(
-            f'[Run {run_id}] Update {update+1:3d}/{n_updates} | '
-            f'Episodes: {len(all_returns):5d} | '
-            f'Mean return: {mean_ret:.4f}'
-        )
- 
+
+        # --- Periodic evaluation checkpoint ---
+        if (update + 1) % eval_every == 0 or update == n_updates - 1:
+            model.eval()
+            eval_returns = []
+            with torch.no_grad():
+                for _ in range(eval_episodes):
+                    e_obs, _ = env_eval.reset(
+                        seed=int(rng.integers(1_000_000)))
+                    e_ret, e_done = 0.0, False
+                    while not e_done:
+                        e_obs_t = torch.FloatTensor(e_obs).unsqueeze(0).to(device)
+                        e_action, _, _ = model.get_action(e_obs_t)
+                        e_obs, e_r, e_te, e_tr, _ = env_eval.step(e_action.item())
+                        e_ret  += e_r
+                        e_done  = e_te or e_tr
+                    eval_returns.append(e_ret)
+            model.train()
+
+            mean_eval = float(np.mean(eval_returns))
+            eval_history.append((update + 1, mean_eval))
+
+            # Track best checkpoint
+            if mean_eval > best_eval:
+                best_eval  = mean_eval
+                best_state = {k: v.clone() for k, v in
+                              model.state_dict().items()}
+
+            # Report to Optuna and (optionally) prune
+            if trial is not None and use_inner_pruning:
+                trial.report(mean_eval, step=update + 1)
+                if trial.should_prune():
+                    env.close()
+                    env_eval.close()
+                    raise optuna.TrialPruned()
+
     env.close()
-    train_time = time.time() - t0
- 
-    # save artefacts 
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(model.state_dict(),                      f'{save_dir}/ppo_run{run_id}.pth')
-    np.save(f'{save_dir}/ppo_returns_run{run_id}.npy',  np.array(all_returns))
- 
-    # final summary
+    env_eval.close()
+    duration = time.time() - t0
+
+    # Persist to disk only for the final retrain
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(best_state, f'{save_dir}/{save_tag}.pth')
+        np.save(f'{save_dir}/{save_tag}_returns.npy', np.array(all_returns))
+        np.save(f'{save_dir}/{save_tag}_eval_history.npy',
+                np.array(eval_history, dtype=object), allow_pickle=True)
+
     model.eval()
-    print(f'\nTraining complete in {train_time:.1f}s')
-    print(f'Total episodes:             {len(all_returns):,}')
-    print(f'Mean return (last 1000 ep): {np.mean(all_returns[-1000:]):.4f}')
-    print(f'Saved → {save_dir}/ppo_run{run_id}.*')
- 
     return {
-        'model':      model,
-        'returns':    all_returns,
-        'train_time': train_time,
-        'run_id':     run_id,
+        'model':        model,
+        'best_eval':    best_eval,
+        'best_state':   best_state,
+        'eval_history': eval_history,
+        'returns':      all_returns,
+        'duration_s':   duration,
     }
- 
+
 
 
 # ------------------------------------- A2C - Shared Actor-Critic Network -----------------------------------------------------
@@ -731,208 +755,6 @@ def train_a2c(
     return {'model': model, 'returns': all_returns}
 
 
-
-# A2C GRID SEARCH FUNCTION
-def a2c_grid_search(
-    param_grid: dict,
-    seeds:      list = [42, 123, 7],
-    n_updates:  int  = 150,
-    n_samples:  int  = None,
-    save_dir:   str  = 'models/a2c_tuning',
-    csv_name:   str  = 'a2c_tuning_results.csv',
-):
-    """
-    Grid/random search for A2C hyperparameters with multiple seeds.
-
-    Parameters:
-        param_grid : dict {param_name: value or [values_to_try]}.
-                     Single values are fixed; lists are swept.
-        seeds      : seeds to replicate each configuration
-        n_updates  : gradient updates per training run
-        n_samples  : if set, randomly samples this many combos (random search)
-        save_dir   : directory for partial CSV and model weights
-        csv_name   : results CSV filename
-
-    Returns:
-        pd.DataFrame sorted by survival_mean descending
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    csv_path = os.path.join(save_dir, csv_name)
-
-    # Separate tuned (list) from fixed (scalar) params
-    tuned  = {k: v for k, v in param_grid.items() if isinstance(v, list)}
-    fixed  = {k: v for k, v in param_grid.items() if not isinstance(v, list)}
-
-    # Generate all combinations of tuned params
-    names  = list(tuned.keys())
-    values = list(tuned.values())
-    combos = list(itertools.product(*values))
-
-    if n_samples is not None and n_samples < len(combos):
-        random.seed(42)
-        combos = random.sample(combos, n_samples)
-
-    print(f'Tuned  params : {names}')
-    print(f'Fixed  params : {fixed}')
-    print(f'Total configs : {len(combos)} | Seeds: {len(seeds)} | '
-          f'Total runs: {len(combos) * len(seeds)}\n')
-
-    results = []
-
-    for i, combo in enumerate(combos):
-        config = dict(zip(names, combo))
-        print(f'\n=== Config {i+1}/{len(combos)}: {config} ===')
-
-        seed_survivals = []
-        seed_returns   = []
-
-        for seed in seeds:
-            np.random.seed(seed)
-            random.seed(seed)
-            torch.manual_seed(seed)
-
-            r = train_a2c(
-                run_id    = f'tune_{i}_s{seed}',
-                n_updates = n_updates,
-                **config,
-                **fixed,
-            )
-
-            eval_returns, *_ = evaluate(
-                r['model'], make_clinical_env, is_ppo=True,
-                label=f'tune_{i}'
-            )
-
-            survival    = float(np.mean(eval_returns > 0)) * 100
-            mean_return = float(np.mean(eval_returns))
-
-            seed_survivals.append(survival)
-            seed_returns.append(mean_return)
-
-            print(f'  Seed {seed}: survival={survival:.1f}%,'
-                  f' return={mean_return:.4f}')
-
-        results.append({
-            **config,
-            'survival_mean': np.mean(seed_survivals),
-            'survival_std':  np.std(seed_survivals),
-            'return_mean':   np.mean(seed_returns),
-            'return_std':    np.std(seed_returns),
-        })
-
-        # Save partial results after every config (safe if runtime crashes)
-        pd.DataFrame(results) \
-            .sort_values('survival_mean', ascending=False) \
-            .to_csv(csv_path, index=False)
-
-        print(f'  -> survival = {results[-1]["survival_mean"]:.1f}%'
-              f' ± {results[-1]["survival_std"]:.1f}%')
-
-    print(f'\nDone. Results saved to {csv_path}')
-    return pd.DataFrame(results).sort_values('survival_mean', ascending=False)
-
-
-
-
-
-
-
-
-
-def ppo_grid_search(
-    param_grid:  dict,
-    seeds:       list  = [42, 123, 7],
-    n_updates:   int   = 150,
-    n_samples:   int   = None,
-    save_dir:    str   = 'models/ppo_tuning',
-    csv_name:    str   = 'ppo_tuning_results.csv',
-):
-    """
-    Grid/random search for PPO hyperparameters with multiple seeds.
-
-    Parameters:
-        - param_grid : dict {param_name: value or [values_to_try]}.
-                       Single values are fixed; lists are tuned.
-        - seeds      : seeds to replicate each configuration
-        - n_updates  : updates per training run
-        - n_samples  : if set, randomly samples this many combos
-        - save_dir   : where to save partial CSV and model weights
-        - csv_name   : results CSV filename
-
-    Returns:
-        - pd.DataFrame sorted by survival_mean descending
-    """
-
-    os.makedirs(save_dir, exist_ok=True)
-    csv_path = os.path.join(save_dir, csv_name)
-
-    # Separate tuned (list) from fixed (scalar) params
-    tuned = {k: v for k, v in param_grid.items() if isinstance(v, list)}
-    fixed = {k: v for k, v in param_grid.items() if not isinstance(v, list)}
-
-    # Generate combinations of tuned params only
-    names  = list(tuned.keys())
-    values = list(tuned.values())
-    combos = list(itertools.product(*values))
-
-    if n_samples is not None and n_samples < len(combos):
-        random.seed(42)
-        combos = random.sample(combos, n_samples)
-
-    print(f'Tuned params: {names}')
-    print(f'Fixed params: {fixed}')
-    print(f'Total configurations: {len(combos)} | Seeds: {len(seeds)} | '
-          f'Total runs: {len(combos) * len(seeds)}\n')
-
-    results = []
-
-    for i, combo in enumerate(combos):
-        config = dict(zip(names, combo))
-        print(f'\n=== Config {i+1}/{len(combos)}: {config} ===')
-
-        seed_survivals = []
-        seed_returns   = []
-
-        for seed in seeds:
-            np.random.seed(seed)
-            random.seed(seed)
-            torch.manual_seed(seed)
-
-            r = train_ppo(
-                run_id    = f'tune_{i}_s{seed}',
-                n_updates = n_updates,
-                save_dir  = save_dir,
-                **config,
-                **fixed,
-            )
-
-            eval_returns, *_ = evaluate(
-                r['model'], make_clinical_env, is_ppo=True, label=f'tune_{i}'
-            )
-            survival    = float(np.mean(eval_returns > 0)) * 100
-            mean_return = float(np.mean(eval_returns))
-
-            seed_survivals.append(survival)
-            seed_returns.append(mean_return)
-
-            print(f'  Seed {seed}: survival={survival:.1f}%, return={mean_return:.4f}')
-
-        results.append({
-            **config,
-            'survival_mean': np.mean(seed_survivals),
-            'survival_std':  np.std(seed_survivals),
-            'return_mean':   np.mean(seed_returns),
-            'return_std':    np.std(seed_returns),
-        })
-
-        pd.DataFrame(results).sort_values('survival_mean', ascending=False) \
-            .to_csv(csv_path, index=False)
-
-        print(f'  -> survival = {results[-1]["survival_mean"]:.1f}% '
-              f'± {results[-1]["survival_std"]:.1f}%')
-
-    print(f'\nDone. Results saved to {csv_path}')
-    return pd.DataFrame(results).sort_values('survival_mean', ascending=False)
 
 
 # SAC
