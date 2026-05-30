@@ -608,8 +608,7 @@ class A2CNetwork(nn.Module):
 
 
 # A2C TRAINING FUNCTION
-# A2C TRAINING FUNCTION
-def train_a2c(
+def train_a2s(
     run_id:      int   = 1,
     n_updates:   int   = 150,      # total number of gradient updates
     n_steps:     int   = 2048,     # rollout length (steps collected per update)
