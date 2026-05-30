@@ -800,15 +800,15 @@ class SACCritic(nn.Module):
         return self.net(obs)
 
 
-# SAC UPDATE FUNCTION 
-def update_sac(actor, critic, critic_target,
-               actor_optim, critic_optim,
+# SAC UPDATE FUNCTION
+def update_sac(actor, critic1, critic2, critic1_target, critic2_target,
+               actor_optim, critic1_optim, critic2_optim,
                buffer, batch_size, alpha, tau,
                log_dict=None):
-    """Single gradient step for SAC."""
+    """Single gradient step for SAC with double-Q (reduces overestimation bias)."""
     if len(buffer) < batch_size:
         return
-    
+
     states, actions, rewards, next_states, dones = buffer.sample(batch_size)
     states_t      = torch.FloatTensor(states).to(device)
     actions_t     = torch.LongTensor(actions).to(device)
@@ -816,39 +816,44 @@ def update_sac(actor, critic, critic_target,
     next_states_t = torch.FloatTensor(next_states).to(device)
     dones_t       = torch.FloatTensor(dones).to(device)
 
-    # CRITIC UPDATE
+    # CRITIC UPDATE (double-Q: use min of two target critics)
     with torch.no_grad():
         next_probs, next_log_probs = actor(next_states_t)
-        next_q   = critic_target(next_states_t)
-        next_v   = (next_probs * (next_q - alpha * next_log_probs)).sum(dim=1)
+        next_q1 = critic1_target(next_states_t)
+        next_q2 = critic2_target(next_states_t)
+        next_q  = torch.min(next_q1, next_q2)
+        next_v  = (next_probs * (next_q - alpha * next_log_probs)).sum(dim=1)
         target_q = rewards_t + GAMMA * (1 - dones_t) * next_v
 
-    current_q   = critic(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
-    critic_loss = F.mse_loss(current_q, target_q)
+    current_q1 = critic1(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+    current_q2 = critic2(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+    critic1_loss = F.mse_loss(current_q1, target_q)
+    critic2_loss = F.mse_loss(current_q2, target_q)
 
-    critic_optim.zero_grad()
-    critic_loss.backward()
-    critic_optim.step()
+    critic1_optim.zero_grad(); critic1_loss.backward(); critic1_optim.step()
+    critic2_optim.zero_grad(); critic2_loss.backward(); critic2_optim.step()
 
-    # ACTOR UPDATE
+    # ACTOR UPDATE (use min of live critics)
     probs, log_probs = actor(states_t)
     with torch.no_grad():
-        q_values = critic(states_t)
+        q1_live = critic1(states_t)
+        q2_live = critic2(states_t)
+        q_values = torch.min(q1_live, q2_live)
     actor_loss = (probs * (alpha * log_probs - q_values)).sum(dim=1).mean()
 
     actor_optim.zero_grad()
     actor_loss.backward()
     actor_optim.step()
 
-    # SOFT TARGET UPDATE
+    # SOFT TARGET UPDATE (both critics)
     with torch.no_grad():
-        for p, p_target in zip(critic.parameters(), critic_target.parameters()):
-            p_target.data.mul_(1 - tau)
-            p_target.data.add_(tau * p.data)
-    
-    # LOGGING (novo)
+        for p, pt in zip(critic1.parameters(), critic1_target.parameters()):
+            pt.data.mul_(1 - tau); pt.data.add_(tau * p.data)
+        for p, pt in zip(critic2.parameters(), critic2_target.parameters()):
+            pt.data.mul_(1 - tau); pt.data.add_(tau * p.data)
+
     if log_dict is not None:
-        log_dict['critic_loss'].append(critic_loss.item())
+        log_dict['critic_loss'].append((critic1_loss.item() + critic2_loss.item()) / 2)
         log_dict['actor_loss'].append(actor_loss.item())
         log_dict['q_mean'].append(q_values.mean().item())
         log_dict['q_max'].append(q_values.max().item())
@@ -863,7 +868,7 @@ def train_sac(
     min_buffer:   int   = 1_000,
     lr_actor:     float = 3e-4,
     lr_critic:    float = 3e-4,
-    alpha:        float = 0.2,           # entropy coefficient (fixed)
+    alpha:        float = 0.05,          # entropy coefficient (lowered: less forced exploration)
     tau:          float = 0.005,         # soft target update rate
     hidden:       int   = 256,
     save_dir:     str   = 'models',
@@ -871,22 +876,25 @@ def train_sac(
     verbose:      int   = 500,
 ):
     """
-    Discrete Soft Actor-Critic (Phase 1: single Q-network, fixed alpha).
+    Discrete Soft Actor-Critic with double-Q and lower alpha.
 
-    Returns dict with keys: 'actor', 'critic', 'returns', 'train_time', 'run_id'.
+    Returns dict with keys: 'actor', 'critic1', 'critic2', 'returns', 'train_time', 'run_id'.
     """
     env = make_clinical_env()
 
-    # Networks
+    # Networks (double-Q: two independent critics)
     actor          = SACActor(OBS_DIM, N_ACTIONS, hidden).to(device)
-    critic         = SACCritic(OBS_DIM, N_ACTIONS, hidden).to(device)
-    critic_target  = copy.deepcopy(critic).to(device)
-    for p in critic_target.parameters():
+    critic1        = SACCritic(OBS_DIM, N_ACTIONS, hidden).to(device)
+    critic2        = SACCritic(OBS_DIM, N_ACTIONS, hidden).to(device)
+    critic1_target = copy.deepcopy(critic1).to(device)
+    critic2_target = copy.deepcopy(critic2).to(device)
+    for p in list(critic1_target.parameters()) + list(critic2_target.parameters()):
         p.requires_grad = False
 
     # Optimizers
-    actor_optim  = torch.optim.Adam(actor.parameters(),  lr=lr_actor)
-    critic_optim = torch.optim.Adam(critic.parameters(), lr=lr_critic)
+    actor_optim   = torch.optim.Adam(actor.parameters(),   lr=lr_actor)
+    critic1_optim = torch.optim.Adam(critic1.parameters(), lr=lr_critic)
+    critic2_optim = torch.optim.Adam(critic2.parameters(), lr=lr_critic)
 
     # Buffer (reuses the existing ReplayBuffer)
     buffer = ReplayBuffer(buffer_size)
@@ -923,8 +931,8 @@ def train_sac(
 
             # Update networks
             if len(buffer) >= min_buffer:
-                update_sac(actor, critic, critic_target,
-                           actor_optim, critic_optim,
+                update_sac(actor, critic1, critic2, critic1_target, critic2_target,
+                           actor_optim, critic1_optim, critic2_optim,
                            buffer, batch_size, alpha, tau, log_dict=log_dict)
 
         all_returns.append(ep_return)
@@ -946,8 +954,9 @@ def train_sac(
     # Save
     if save_weights:
         os.makedirs(save_dir, exist_ok=True)
-        torch.save(actor.state_dict(),  f'{save_dir}/sac_actor_run{run_id}.pth')
-        torch.save(critic.state_dict(), f'{save_dir}/sac_critic_run{run_id}.pth')
+        torch.save(actor.state_dict(),   f'{save_dir}/sac_actor_run{run_id}.pth')
+        torch.save(critic1.state_dict(), f'{save_dir}/sac_critic1_run{run_id}.pth')
+        torch.save(critic2.state_dict(), f'{save_dir}/sac_critic2_run{run_id}.pth')
         np.save(f'{save_dir}/sac_returns_run{run_id}.npy', np.array(all_returns))
 
     actor.eval()
@@ -956,7 +965,8 @@ def train_sac(
 
     return {
         'actor':      actor,
-        'critic':     critic,
+        'critic1':    critic1,
+        'critic2':    critic2,
         'returns':    all_returns,
         'log_dict':   log_dict,
         'train_time': train_time,
