@@ -27,7 +27,7 @@ from envs.env_setup import (
 from envs.continuous_sepsis_env import ContinuousICUSepsisEnv, FEATURE_NAMES
 from envs.wrappers import (
     EpisodicNoisyObsEnv, EpisodicMissingObsEnv,
-    AcuteEventEnv, make_clinical_env
+    AcuteEventEnv, make_clinical_env, make_ablation_env
 )
 
 # Config B constants
@@ -413,7 +413,218 @@ def objective_ppo(trial):
     seed_metrics = run_multi_seed_trial_ppo(
         trial     = trial,
         hp        = hp,
-        seeds     = SEEDS_OPTUNA,
+        seeds     = [42, 123, 7],
         n_updates = hp['n_updates'],
     )
     return float(np.mean(seed_metrics))
+
+
+# ──────────────────────────────────────────────────────────────
+#  ABLATION STUDY
+# ──────────────────────────────────────────────────────────────
+
+# All 8 wrapper combinations (False = wrapper OFF, True = wrapper ON)
+ABLATION_CONDITIONS = [
+    dict(noisy=False, missing=False, acute=False),  # clean baseline
+    dict(noisy=True,  missing=False, acute=False),  # noisy only
+    dict(noisy=False, missing=True,  acute=False),  # missing only
+    dict(noisy=False, missing=False, acute=True),   # acute only
+    dict(noisy=True,  missing=True,  acute=False),  # noisy + missing
+    dict(noisy=True,  missing=False, acute=True),   # noisy + acute
+    dict(noisy=False, missing=True,  acute=True),   # missing + acute
+    dict(noisy=True,  missing=True,  acute=True),   # full clinical
+]
+
+ABLATION_LABELS = [
+    'Baseline (clean)',
+    'Noisy only',
+    'Missing only',
+    'Acute only',
+    'Noisy + Missing',
+    'Noisy + Acute',
+    'Missing + Acute',
+    'Full clinical',
+]
+
+
+def train_ppo_ablation(
+    condition: dict,
+    n_updates=150,
+    n_steps=4096,
+    n_epochs=10,
+    batch_size=256,
+    lr=1e-4,
+    clip=0.2,
+    gae_lam=0.95,
+    ent_coef=0.02,
+    vf_coef=0.5,
+    max_grad=0.5,
+    eval_every=25,
+    eval_episodes=500,
+    seed=42,
+):
+    """
+    Train PPO on a single ablation condition and return survival rate.
+
+    `condition` is a dict with keys noisy/missing/acute (bool) passed
+    directly to make_ablation_env().
+    """
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    model     = ActorCritic().to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    buffer    = RolloutBuffer()
+
+    env      = make_ablation_env(**condition)
+    env_eval = make_ablation_env(**condition)
+
+    obs, _    = env.reset(seed=int(rng.integers(1_000_000)))
+    ep_return = 0.0
+    all_returns  = []
+    eval_history = []
+    best_eval    = -float('inf')
+    best_state   = {k: v.clone() for k, v in model.state_dict().items()}
+
+    for update in range(n_updates):
+        buffer.clear()
+
+        for _ in range(n_steps):
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action, log_prob, value = model.get_action(obs_t)
+
+            next_obs, reward, te, tr, _ = env.step(action.item())
+            done = te or tr
+            buffer.push(obs, action.item(), reward, float(done), log_prob.item(), value)
+            ep_return += reward
+            obs = next_obs
+            if done:
+                all_returns.append(ep_return)
+                ep_return = 0.0
+                obs, _ = env.reset(seed=int(rng.integers(1_000_000)))
+
+        advantages_raw = compute_gae(buffer.rewards, buffer.values, buffer.dones, lam=gae_lam)
+        advantages_raw = torch.FloatTensor(advantages_raw).to(device)
+        returns_gae    = advantages_raw + torch.FloatTensor([v.item() for v in buffer.values]).to(device)
+        advantages     = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
+
+        states_t  = torch.FloatTensor(np.array(buffer.states)).to(device)
+        actions_t = torch.LongTensor(buffer.actions).to(device)
+        old_lp_t  = torch.FloatTensor(buffer.log_probs).to(device)
+
+        indices = np.arange(n_steps)
+        for _ in range(n_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, n_steps - batch_size + 1, batch_size):
+                idx = indices[start:start + batch_size]
+                log_prob, value, entropy = model.evaluate(states_t[idx], actions_t[idx])
+                ratio      = torch.exp(log_prob - old_lp_t[idx])
+                surr1      = ratio * advantages[idx]
+                surr2      = torch.clamp(ratio, 1 - clip, 1 + clip) * advantages[idx]
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = F.mse_loss(value, returns_gae[idx])
+                loss = actor_loss + vf_coef * critic_loss + (-ent_coef * entropy.mean())
+                optimiser.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+                optimiser.step()
+
+        if (update + 1) % eval_every == 0 or update == n_updates - 1:
+            model.eval()
+            eval_returns = []
+            with torch.no_grad():
+                for _ in range(eval_episodes):
+                    e_obs, _ = env_eval.reset(seed=int(rng.integers(1_000_000)))
+                    e_ret, e_done = 0.0, False
+                    while not e_done:
+                        e_obs_t = torch.FloatTensor(e_obs).unsqueeze(0).to(device)
+                        e_action, _, _ = model.get_action(e_obs_t)
+                        e_obs, e_r, e_te, e_tr, _ = env_eval.step(e_action.item())
+                        e_ret += e_r
+                        e_done = e_te or e_tr
+                    eval_returns.append(e_ret)
+            model.train()
+            mean_eval = float(np.mean(eval_returns))
+            eval_history.append((update + 1, mean_eval))
+            if mean_eval > best_eval:
+                best_eval  = mean_eval
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    env.close()
+    env_eval.close()
+
+    model.load_state_dict(best_state)
+    model.eval()
+    return {
+        'model':        model,
+        'best_eval':    best_eval,
+        'eval_history': eval_history,
+        'returns':      all_returns,
+    }
+
+
+def run_ablation_study(
+    best_hp: dict,
+    seeds: list = [42, 123, 7],
+    n_updates: int = 150,
+    eval_episodes: int = 500,
+    save_dir: str = 'models/ablation',
+):
+    """
+    Train PPO on all 8 ablation conditions and return a summary DataFrame.
+
+    `best_hp` should be the dict of best hyperparameters from Optuna tuning,
+    e.g. {'lr': 1e-4, 'ent_coef': 0.02, 'n_steps': 4096, ...}.
+    Results are averaged across `seeds` for robustness.
+
+    Returns a pandas DataFrame with columns:
+        condition, noisy, missing, acute, mean_survival, std_survival
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    hp = {k: v for k, v in best_hp.items()
+          if k in ('n_steps', 'n_epochs', 'batch_size', 'lr', 'clip',
+                   'gae_lam', 'ent_coef', 'vf_coef', 'max_grad')}
+    hp['n_updates']     = n_updates
+    hp['eval_episodes'] = eval_episodes
+
+    records = []
+    for label, condition in zip(ABLATION_LABELS, ABLATION_CONDITIONS):
+        print(f'\n{"="*60}')
+        print(f'  Condition: {label}')
+        print(f'{"="*60}')
+        seed_survivals = []
+        for seed in seeds:
+            print(f'  seed={seed} ... ', end='', flush=True)
+            result = train_ppo_ablation(condition=condition, seed=seed, **hp)
+            survival = result['best_eval']
+            seed_survivals.append(survival)
+            print(f'survival={survival:.4f}')
+
+        mean_s = float(np.mean(seed_survivals))
+        std_s  = float(np.std(seed_survivals))
+        print(f'  → mean={mean_s:.4f}  std={std_s:.4f}')
+
+        records.append({
+            'condition':       label,
+            'noisy':           condition['noisy'],
+            'missing':         condition['missing'],
+            'acute':           condition['acute'],
+            'mean_survival':   mean_s,
+            'std_survival':    std_s,
+            'seed_survivals':  seed_survivals,
+        })
+
+        # Save intermediate results so progress is not lost
+        pd.DataFrame(records).to_csv(f'{save_dir}/ablation_results.csv', index=False)
+
+    df = pd.DataFrame(records)
+    print('\n' + '='*60)
+    print(df[['condition', 'mean_survival', 'std_survival']].to_string(index=False))
+    print('='*60)
+    print(f'\nResults saved to {save_dir}/ablation_results.csv')
+    return df

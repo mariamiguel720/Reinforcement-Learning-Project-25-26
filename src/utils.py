@@ -55,10 +55,10 @@ def rollout(env, n_episodes: int, seed: int = SEED):
 
 
 # EVALUATION FUNCTION 
-N_EPISODES = 1000
-clinical_env = make_clinical_env()
-records_clinical = rollout(clinical_env, N_EPISODES)
-clinical_env.close()
+# N_EPISODES = 1000
+# clinical_env = make_clinical_env()
+# records_clinical = rollout(clinical_env, N_EPISODES)
+# clinical_env.close()
 
 df_clinical = pd.DataFrame([{k: v for k, v in r.items() if k != 'obs_traj'}
                             for r in records_clinical])
@@ -160,6 +160,94 @@ def survival_ci(returns, confidence=0.95):
     lower = (ci[0] / n) * 100
     upper = (ci[1] / n) * 100
     return p * 100, lower, upper
+
+
+def print_ablation_summary(df_ablation):
+    """
+    Print a summary table and auto-interpretation of the ablation results.
+    `df_ablation` is the DataFrame returned by run_ablation_study().
+    """
+    baseline = df_ablation.loc[df_ablation['condition'] == 'Baseline (clean)', 'mean_survival'].values[0]
+
+    print('═' * 65)
+    print('  PPO Ablation Study — Summary')
+    print('═' * 65)
+    print(f'  {"Condition":<22} {"Survival":>10} {"Std":>8} {"vs Baseline":>12}')
+    print('─' * 65)
+    for _, row in df_ablation.iterrows():
+        delta = (row['mean_survival'] - baseline) * 100
+        print(f'  {row["condition"]:<22} {row["mean_survival"]*100:>9.1f}%'
+              f' {row["std_survival"]*100:>7.1f}%'
+              f' {delta:>+11.1f}pp')
+    print('═' * 65)
+
+    # Identify most damaging single wrapper
+    singles = df_ablation[
+        df_ablation['condition'].isin(['Noisy only', 'Missing only', 'Acute only'])
+    ].copy()
+    singles['delta'] = (singles['mean_survival'] - baseline) * 100
+    worst = singles.loc[singles['delta'].idxmin()]
+
+    # Check additivity: noisy+missing vs noisy_only + missing_only
+    def get(cond): return df_ablation.loc[df_ablation['condition'] == cond, 'mean_survival'].values[0]
+    additive_nm  = (get('Noisy only') + get('Missing only') - baseline) * 100
+    actual_nm    = (get('Noisy + Missing') - baseline) * 100
+    interaction  = actual_nm - additive_nm
+
+    print(f'\n  Most damaging single wrapper : {worst["condition"]} ({worst["delta"]:+.1f}pp)')
+    print(f'  Full clinical vs baseline   : {(get("Full clinical") - baseline)*100:+.1f}pp')
+    print(f'  Noisy+Missing additivity gap: {interaction:+.1f}pp '
+          f'({"synergistic" if interaction < -1 else "antagonistic" if interaction > 1 else "approximately additive"})')
+    print('═' * 65)
+
+
+def plot_ablation_results(df_ablation, baseline_survival=None):
+    """
+    Bar chart of survival rate for each ablation condition.
+    `df_ablation` is the DataFrame returned by run_ablation_study().
+    `baseline_survival` is the clean baseline survival rate (%) — drawn as a dashed line.
+    """
+    labels   = df_ablation['condition'].tolist()
+    means    = df_ablation['mean_survival'].tolist()
+    stds     = df_ablation['std_survival'].tolist()
+
+    colors = []
+    for _, row in df_ablation.iterrows():
+        n_wrappers = int(row['noisy']) + int(row['missing']) + int(row['acute'])
+        palette = ['#2f94d7', '#f0a500', '#e06c2f', '#c0392b']
+        colors.append(palette[n_wrappers])
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    x = np.arange(len(labels))
+    bars = ax.bar(x, [m * 100 for m in means],
+                  yerr=[s * 100 for s in stds],
+                  color=colors, width=0.6, capsize=5,
+                  error_kw={'ecolor': 'black', 'linewidth': 1.2})
+
+    for bar, m, s in zip(bars, means, stds):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + s * 100 + 1.5,
+                f'{m*100:.1f}%',
+                ha='center', va='bottom', fontsize=9)
+
+    if baseline_survival is None and len(means) > 0:
+        baseline_survival = means[0] * 100  # first row is clean baseline
+    if baseline_survival is not None:
+        ax.axhline(baseline_survival * (1 if baseline_survival > 1 else 100),
+                   color='#0a1f35', linestyle='--', linewidth=1.4,
+                   label='Clean baseline')
+
+    ax.axhline(clinical_rand_mean * 100, color='grey',
+               linestyle=':', linewidth=1.2, label='Random baseline')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=9)
+    ax.set_ylabel('Survival Rate (%)')
+    ax.set_title('PPO Ablation Study — Impact of Clinical Reality Wrappers', fontweight='bold')
+    ax.set_ylim(0, 100)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_episode_type_comparison(noisy, clean, missing, label):
