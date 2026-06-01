@@ -55,10 +55,10 @@ def rollout(env, n_episodes: int, seed: int = SEED):
 
 
 # EVALUATION FUNCTION 
-# N_EPISODES = 1000
-# clinical_env = make_clinical_env()
-# records_clinical = rollout(clinical_env, N_EPISODES)
-# clinical_env.close()
+N_EPISODES = 1000
+clinical_env = make_clinical_env()
+records_clinical = rollout(clinical_env, N_EPISODES)
+clinical_env.close()
 
 df_clinical = pd.DataFrame([{k: v for k, v in r.items() if k != 'obs_traj'}
                             for r in records_clinical])
