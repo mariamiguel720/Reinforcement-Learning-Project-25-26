@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import torch
 from scipy import stats
 
-from src.algorithms import *
+from src.ppo_functions import *
+
 # Project modules
 from envs.env_setup import (
     ENV_ID, N_STATES, N_ACTIONS, STATE_SURVIVED, STATE_DIED,
@@ -169,7 +170,7 @@ def survival_ci(returns, confidence=0.95):
     return p * 100, lower, upper
 
 
-def plot_episode_type_comparison(noisy, clean, missing, label):
+def plot_episode_type_comparison(noisy, clean, missing, label, baseline=None):
     """Bar chart comparing survival rates across clinical episode types."""
     groups = ['Clean\nepisodes', 'Noisy\nepisodes', 'Missing\nfeatures']
     data   = [clean, noisy, missing]
@@ -186,7 +187,6 @@ def plot_episode_type_comparison(noisy, clean, missing, label):
                   yerr=[lowers, uppers], capsize=5,
                   error_kw={'ecolor': 'black', 'linewidth': 1.2})
 
-    # Annotate bars
     for bar, rate, n in zip(bars, rates, [len(d) for d in data]):
         ax.text(bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + max(uppers) + 3,
@@ -196,8 +196,11 @@ def plot_episode_type_comparison(noisy, clean, missing, label):
     ax.set_ylabel('Survival Rate (%)')
     ax.set_title(f'{label} — Survival Rate by Episode Type', fontweight='bold')
     ax.set_ylim(0, 100)
-    ax.axhline(y=clinical_rand_mean * 100, color='#0a1f35',
-               linestyle='--', linewidth=1.2, label='Random baseline')
-    ax.legend()
+
+    if baseline is not None:
+        ax.axhline(y=baseline * 100, color='#0a1f35',
+                   linestyle='--', linewidth=1.2, label='Random baseline')
+        ax.legend()
+
     plt.tight_layout()
     plt.show()

@@ -46,7 +46,13 @@ class QNetwork(nn.Module):
     Q-value approximator: Q(s, a) for all 25 actions simultaneously.
 
     LayerNorm after each hidden layer handles the different scales of the
-    47 physiological features without requiring explicit observation normalization.
+    47 physiological features without requiring explicit observation normalisation.
+
+    Parameters
+    ----------
+    obs_dim   : int — number of input features (default: 47)
+    n_actions : int — number of discrete actions (default: 25)
+    hidden    : int — number of units in each hidden layer (default: 256)
     """
     def __init__(self, obs_dim: int = OBS_DIM, n_actions: int = N_ACTIONS, hidden: int = 256):
         super().__init__()
@@ -61,6 +67,7 @@ class QNetwork(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return Q-values for all actions given observation x. Shape: (batch, n_actions)."""
         return self.net(x)
 
 
@@ -68,14 +75,26 @@ class ReplayBuffer:
     """
     Fixed-capacity circular buffer storing (s, a, r, s', done) transitions.
     Samples uniform random mini-batches to break temporal correlations.
+
+    Parameters
+    ----------
+    capacity : int — maximum number of transitions stored; oldest are dropped when full.
     """
     def __init__(self, capacity: int = 100_000):
         self.buffer = deque(maxlen=capacity)
 
     def push(self, state, action, reward, next_state, done):
+        """Add a single transition to the buffer."""
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size: int):
+        """
+        Sample a random mini-batch of transitions.
+
+        Returns
+        -------
+        Tuple of five np.ndarrays: (states, actions, rewards, next_states, dones).
+        """
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
@@ -107,33 +126,36 @@ def train_dqn(
     verbose:         int   = 1000,
 ):
     """
-    Train a DQN agent on the Config B clinical environment. Saves model weights, episode returns and TD losses to 
-    `save_dir` at the end of training so results survive session restarts.
+    Train a DQN agent on the Config B clinical environment.
 
-    Parameters:
-        - run_id          : integer label used in saved file names
-                      (dqn_run{run_id}.pth, dqn_returns_run{run_id}.npy, …)
-        - n_episodes      : total number of training episodes
-        - buffer_capacity : maximum transitions stored in the replay buffer
-        - batch_size      : number of transitions sampled per gradient step
-        - min_buffer      : minimum transitions in buffer before training starts
-        - lr              : Adam learning rate
-        - grad_clip       : maximum L2 norm for gradient clipping
-        - eps_start       : starting epsilon for epsilon-greedy exploration
-        - eps_end         : minimum epsilon (exploration floor)
-        - eps_decay       : epsilon is multiplied by this value after each episode
-        - target_update   : frequency (in episodes) of hard target-network updates
-        - save_dir        : directory where weights and arrays are saved
-        - verbose         : print a progress line every N episodes; 0 = silent
+    Saves model weights, episode returns, and TD losses to `save_dir` at the
+    end of training so results survive session restarts.
 
-    Returns:
-        - dict with keys:
-            'online'       : trained QNetwork (online network, in eval mode)
-            'returns'      : list[float]  per-episode returns  (len = n_episodes)
-            'losses'       : list[float]  per-step TD losses   (len = gradient steps)
-            'total_steps'  : int          total environment steps taken
-            'train_time'   : float        wall-clock training time in seconds
-            'run_id'       : int          the run_id passed in
+    Parameters
+    ----------
+    run_id          : int   — label used in saved file names (dqn_run{run_id}.*)
+    n_episodes      : int   — total number of training episodes
+    buffer_capacity : int   — maximum transitions stored in the replay buffer
+    batch_size      : int   — number of transitions sampled per gradient step
+    min_buffer      : int   — minimum buffer size before gradient updates begin
+    lr              : float — Adam learning rate
+    grad_clip       : float — maximum L2 norm for gradient clipping
+    eps_start       : float — starting epsilon for epsilon-greedy exploration
+    eps_end         : float — minimum epsilon (exploration floor)
+    eps_decay       : float — multiplicative decay applied to epsilon each episode
+    target_update   : int   — frequency (in episodes) of hard target-network updates
+    save_dir        : str   — directory where weights and arrays are saved
+    verbose         : int   — print a progress line every N episodes; 0 = silent
+
+    Returns
+    -------
+    dict with keys:
+        'online'      : QNetwork  — trained online network (eval mode)
+        'returns'     : list[float] — per-episode returns (len = n_episodes)
+        'losses'      : list[float] — per-step TD losses (len = gradient steps)
+        'total_steps' : int         — total environment steps taken
+        'train_time'  : float       — wall-clock training time in seconds
+        'run_id'      : int         — the run_id passed in
     """
 
     # networks & optimiser 
@@ -252,7 +274,19 @@ def train_dqn(
 # SAC NETWORKS
 
 class SACActor(nn.Module):
-    """Policy network for discrete SAC. Outputs action probabilities."""
+    """
+    Policy network for discrete SAC.
+
+    Maps observations to a distribution over actions via softmax.
+    Both probs and log_probs are returned to avoid recomputation in the
+    critic and entropy updates.
+
+    Parameters
+    ----------
+    obs_dim   : int — number of input features
+    n_actions : int — number of discrete actions
+    hidden    : int — number of units in each hidden layer
+    """
     def __init__(self, obs_dim, n_actions, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -262,6 +296,14 @@ class SACActor(nn.Module):
         )
 
     def forward(self, obs):
+        """
+        Return action probabilities and log-probabilities for all actions.
+
+        Returns
+        -------
+        probs     : Tensor (batch, n_actions) — softmax probabilities
+        log_probs : Tensor (batch, n_actions) — log-softmax (numerically stable)
+        """
         logits = self.net(obs)
         probs  = F.softmax(logits, dim=-1)
         # Numerical stability: log(probs) directly via log_softmax
@@ -269,7 +311,15 @@ class SACActor(nn.Module):
         return probs, log_probs
 
     def sample(self, obs):
-        """Sample an action from the policy."""
+        """
+        Sample a single action from the current policy.
+
+        Returns
+        -------
+        action    : Tensor (batch,) — sampled action indices
+        probs     : Tensor (batch, n_actions)
+        log_probs : Tensor (batch, n_actions)
+        """
         probs, log_probs = self.forward(obs)
         dist   = Categorical(probs=probs)
         action = dist.sample()
@@ -277,7 +327,17 @@ class SACActor(nn.Module):
 
 
 class SACCritic(nn.Module):
-    """Q-network. Outputs Q-values for all discrete actions."""
+    """
+    Q-network for discrete SAC. Outputs Q-values for all actions simultaneously.
+
+    Two independent instances are used (double-Q) to reduce overestimation bias.
+
+    Parameters
+    ----------
+    obs_dim   : int — number of input features
+    n_actions : int — number of discrete actions
+    hidden    : int — number of units in each hidden layer
+    """
     def __init__(self, obs_dim, n_actions, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -287,6 +347,7 @@ class SACCritic(nn.Module):
         )
 
     def forward(self, obs):
+        """Return Q-values for all actions. Shape: (batch, n_actions)."""
         return self.net(obs)
 
 
@@ -295,7 +356,24 @@ def update_sac(actor, critic1, critic2, critic1_target, critic2_target,
                actor_optim, critic1_optim, critic2_optim,
                buffer, batch_size, alpha, tau,
                log_dict=None):
-    """Single gradient step for SAC with double-Q (reduces overestimation bias)."""
+    """
+    Perform a single gradient update step for all SAC networks.
+
+    Updates both critics via MSE against the Bellman target, then updates the
+    actor to maximise expected Q minus entropy, and finally soft-updates both
+    target critics with Polyak averaging.
+
+    Parameters
+    ----------
+    actor, critic1, critic2                   : live networks
+    critic1_target, critic2_target            : target networks (no grad)
+    actor_optim, critic1_optim, critic2_optim : Adam optimisers
+    buffer     : ReplayBuffer — source of training transitions
+    batch_size : int   — number of transitions to sample
+    alpha      : float — entropy temperature coefficient
+    tau        : float — Polyak averaging rate for soft target updates
+    log_dict   : dict | None — if provided, losses and diagnostics are appended
+    """
     if len(buffer) < batch_size:
         return
 
@@ -366,9 +444,37 @@ def train_sac(
     verbose:      int   = 500,
 ):
     """
-    Discrete Soft Actor-Critic with double-Q and lower alpha.
+    Train a discrete Soft Actor-Critic agent on the Config B clinical environment.
 
-    Returns dict with keys: 'actor', 'critic1', 'critic2', 'returns', 'train_time', 'run_id'.
+    Uses double-Q critics to reduce overestimation bias and a fixed entropy
+    temperature alpha (no automatic tuning).
+
+    Parameters
+    ----------
+    run_id       : int   — label used in saved file names (sac_*_run{run_id}.*)
+    n_episodes   : int   — total number of training episodes
+    buffer_size  : int   — maximum transitions stored in the replay buffer
+    batch_size   : int   — number of transitions sampled per gradient step
+    min_buffer   : int   — minimum buffer size before gradient updates begin
+    lr_actor     : float — Adam learning rate for the actor
+    lr_critic    : float — Adam learning rate for both critics
+    alpha        : float — entropy temperature (higher = more exploration)
+    tau          : float — Polyak averaging rate for soft target updates
+    hidden       : int   — number of units in each hidden layer
+    save_dir     : str   — directory where weights and returns are saved
+    save_weights : bool  — whether to persist network weights to disk
+    verbose      : int   — print a progress line every N episodes; 0 = silent
+
+    Returns
+    -------
+    dict with keys:
+        'actor'      : SACActor  — trained actor (eval mode)
+        'critic1'    : SACCritic — first trained critic
+        'critic2'    : SACCritic — second trained critic
+        'returns'    : list[float] — per-episode returns (len = n_episodes)
+        'log_dict'   : dict        — per-step losses and diagnostics
+        'train_time' : float       — wall-clock training time in seconds
+        'run_id'     : int         — the run_id passed in
     """
     env = make_clinical_env()
 
@@ -429,9 +535,9 @@ def train_sac(
 
         if verbose and (ep + 1) % verbose == 0:
             mean_ret = np.mean(all_returns[-verbose:])
-            recent_q       = np.mean(log_dict['q_mean'][-1000:]) if log_dict['q_mean'] else 0
-            recent_entropy = np.mean(log_dict['policy_entropy'][-1000:]) if log_dict['policy_entropy'] else 0
-            recent_c_loss  = np.mean(log_dict['critic_loss'][-1000:]) if log_dict['critic_loss'] else 0
+            recent_q       = np.mean(log_dict['q_mean'][-verbose:]) if log_dict['q_mean'] else 0
+            recent_entropy = np.mean(log_dict['policy_entropy'][-verbose:]) if log_dict['policy_entropy'] else 0
+            recent_c_loss  = np.mean(log_dict['critic_loss'][-verbose:]) if log_dict['critic_loss'] else 0
             print(f'[SAC Run {run_id}] Ep {ep+1:5d}/{n_episodes} | '
                 f'return: {mean_ret:.4f} | '
                 f'Q_mean: {recent_q:+.3f} | '
@@ -462,3 +568,281 @@ def train_sac(
         'train_time': train_time,
         'run_id':     run_id,
     }
+
+
+# -------------------------------------- DQN — Optuna-compatible training --------------------------------------
+
+def train_dqn_optuna(
+    n_episodes:      int   = 10_000,
+    buffer_capacity: int   = 100_000,
+    batch_size:      int   = 64,
+    min_buffer:      int   = 500,
+    lr:              float = 1e-3,
+    grad_clip:       float = 10.0,
+    eps_start:       float = 1.0,
+    eps_end:         float = 0.05,
+    eps_decay:       float = 0.9995,
+    target_update:   int   = 50,
+    seed:            int   = 42,
+    eval_every:      int   = 1000,   # evaluate every N episodes
+    eval_episodes:   int   = 100,    # greedy rollouts per checkpoint
+    trial            = None,         # Optuna trial object; None = normal run
+    use_inner_pruning: bool = False,  # only active for the first two seeds
+    save_dir:        str  = None,    # None during tuning, path for final retrain
+    save_tag:        str  = 'dqn',
+):
+    """
+    DQN training function compatible with Optuna.
+
+    When `trial` is provided and `use_inner_pruning=True`, the function
+    reports the mean return at each eval checkpoint (step = eval_count, starting
+    at 1) and raises `TrialPruned` if the pruner decides to cut early.
+
+    Inner pruning uses steps in [1, n_evals].
+    Outer pruning (in run_multi_seed_trial_dqn) uses steps beyond n_evals,
+    so the two ranges never overlap and the MedianPruner compares consistently.
+
+    Parameters
+    ----------
+    n_episodes        : int   — total number of training episodes
+    buffer_capacity   : int   — maximum transitions stored in the replay buffer
+    batch_size        : int   — number of transitions sampled per gradient step
+    min_buffer        : int   — minimum buffer size before gradient updates begin
+    lr                : float — Adam learning rate
+    grad_clip         : float — maximum L2 norm for gradient clipping
+    eps_start         : float — starting epsilon for epsilon-greedy exploration
+    eps_end           : float — minimum epsilon (exploration floor)
+    eps_decay         : float — multiplicative decay applied to epsilon each episode
+    target_update     : int   — frequency (in episodes) of hard target-network updates
+    seed              : int   — random seed for reproducibility
+    eval_every        : int   — run a greedy evaluation every N episodes
+    eval_episodes     : int   — number of greedy rollouts per evaluation checkpoint
+    trial             : optuna.Trial | None — if None, runs without Optuna integration
+    use_inner_pruning : bool  — whether to report to the pruner at each eval checkpoint
+    save_dir          : str | None — if provided, best checkpoint and returns are saved here
+    save_tag          : str   — prefix for saved file names
+
+    Returns
+    -------
+    dict with keys:
+        'online'       : QNetwork    — trained online network (eval mode)
+        'best_eval'    : float       — best mean return across eval checkpoints
+        'best_state'   : dict        — state_dict of the best checkpoint
+        'eval_history' : list[tuple] — (episode, mean_return) at each checkpoint
+        'returns'      : list[float] — per-episode returns during training
+        'duration_s'   : float       — wall-clock training time in seconds
+        'n_evals'      : int         — total number of eval checkpoints completed
+    """
+    # Reproducibility
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    online = QNetwork().to(device)
+    target = QNetwork().to(device)
+    target.load_state_dict(online.state_dict())
+    target.eval()
+
+    optimiser = torch.optim.Adam(online.parameters(), lr=lr)
+    buffer    = ReplayBuffer(buffer_capacity)
+    best_state = {k: v.clone() for k, v in online.state_dict().items()}
+
+    all_returns  = []
+    eval_history = []
+    best_eval    = -float('inf')
+    eval_count   = 0
+    eps          = eps_start
+    t0           = time.time()
+
+    env      = make_clinical_env()
+    env_eval = make_clinical_env()
+
+    for ep in range(n_episodes):
+        obs, _    = env.reset(seed=int(rng.integers(1_000_000)))
+        ep_return = 0.0
+        done      = False
+
+        while not done:
+            if random.random() < eps:
+                action = env.action_space.sample()
+            else:
+                with torch.no_grad():
+                    obs_t  = torch.FloatTensor(obs).unsqueeze(0).to(device)
+                    action = int(online(obs_t).argmax(1).item())
+
+            next_obs, reward, te, tr, _ = env.step(action)
+            done = te or tr
+            buffer.push(obs, action, reward, next_obs, float(done))
+            obs        = next_obs
+            ep_return += reward
+
+            if len(buffer) >= min_buffer:
+                states, actions, rewards, next_states, dones = buffer.sample(batch_size)
+                states_t      = torch.FloatTensor(states).to(device)
+                actions_t     = torch.LongTensor(actions).to(device)
+                rewards_t     = torch.FloatTensor(rewards).to(device)
+                next_states_t = torch.FloatTensor(next_states).to(device)
+                dones_t       = torch.FloatTensor(dones).to(device)
+
+                q_values = online(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+                with torch.no_grad():
+                    next_q   = target(next_states_t).max(1)[0]
+                    q_target = rewards_t + GAMMA * next_q * (1 - dones_t)
+
+                loss = nn.MSELoss()(q_values, q_target)
+                optimiser.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(online.parameters(), grad_clip)
+                optimiser.step()
+
+        all_returns.append(ep_return)
+        eps = max(eps_end, eps * eps_decay)
+
+        if ep % target_update == 0:
+            target.load_state_dict(online.state_dict())
+
+        # Periodic evaluation checkpoint
+        if (ep + 1) % eval_every == 0 or ep == n_episodes - 1:
+            online.eval()
+            eval_returns = []
+            with torch.no_grad():
+                for _ in range(eval_episodes):
+                    e_obs, _ = env_eval.reset(seed=int(rng.integers(1_000_000)))
+                    e_ret, e_done = 0.0, False
+                    while not e_done:
+                        e_obs_t = torch.FloatTensor(e_obs).unsqueeze(0).to(device)
+                        e_action = int(online(e_obs_t).argmax(1).item())
+                        e_obs, e_r, e_te, e_tr, _ = env_eval.step(e_action)
+                        e_ret  += e_r
+                        e_done  = e_te or e_tr
+                    eval_returns.append(e_ret)
+            online.train()
+
+            mean_eval = float(np.mean(eval_returns))
+            eval_count += 1
+            eval_history.append((ep + 1, mean_eval))
+
+            if mean_eval > best_eval:
+                best_eval  = mean_eval
+                best_state = {k: v.clone() for k, v in online.state_dict().items()}
+
+            # Report to Optuna using eval_count as step — stays in [1, n_evals]
+            # so it never overlaps with the outer pruning steps used in
+            # run_multi_seed_trial_dqn (which start at n_evals + 1).
+            if trial is not None and use_inner_pruning:
+                trial.report(mean_eval, step=eval_count)
+                if trial.should_prune():
+                    env.close()
+                    env_eval.close()
+                    raise optuna.TrialPruned()
+
+    env.close()
+    env_eval.close()
+    duration = time.time() - t0
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(best_state, f'{save_dir}/{save_tag}.pth')
+        np.save(f'{save_dir}/{save_tag}_returns.npy', np.array(all_returns))
+        np.save(f'{save_dir}/{save_tag}_eval_history.npy',
+                np.array(eval_history, dtype=object), allow_pickle=True)
+
+    online.eval()
+    return {
+        'online':       online,
+        'best_eval':    best_eval,
+        'best_state':   best_state,
+        'eval_history': eval_history,
+        'returns':      all_returns,
+        'duration_s':   duration,
+        'n_evals':      eval_count,
+    }
+
+
+def run_multi_seed_trial_dqn(trial, hp, seeds=[42, 123, 7], n_episodes=10_000):
+    """
+    Run multiple seeds for a single Optuna DQN trial.
+
+    The first `PRUNE_SEEDS` seeds use inner pruning (steps 1..n_evals).
+    After each seed the running mean is reported at step n_evals + i + 1,
+    which is strictly beyond the inner range — no step overlap, so the
+    MedianPruner always compares trials at consistent checkpoints.
+
+    Parameters
+    ----------
+    trial      : optuna.Trial — current Optuna trial for reporting and pruning
+    hp         : dict — hyperparameters to pass to train_dqn_optuna (must NOT contain 'n_episodes')
+    seeds      : list[int] — random seeds to run; each seed is one independent training run
+    n_episodes : int — number of training episodes per seed
+
+    Returns
+    -------
+    list[float] — per-seed metric (mean of last 3 eval checkpoints for each seed)
+    """
+    seed_metrics = []
+    seed_times   = []
+    n_evals      = None   # filled after first seed completes
+    PRUNE_SEEDS  = 2
+
+    for i, seed in enumerate(seeds):
+        hp_clean = {k: v for k, v in hp.items() if k != 'n_episodes'}
+        result = train_dqn_optuna(
+            trial             = trial,
+            seed              = seed,
+            n_episodes        = n_episodes,
+            use_inner_pruning = (i < PRUNE_SEEDS),
+            save_dir          = None,
+            **hp_clean,
+        )
+
+        # Capture n_evals from the first seed (consistent across seeds with same hp)
+        if n_evals is None:
+            n_evals = result['n_evals']
+
+        last3 = [r for _, r in result['eval_history'][-3:]]
+        m     = float(np.mean(last3))
+        seed_metrics.append(m)
+        seed_times.append(result['duration_s'])
+
+        # Outer pruning step is strictly beyond the inner range
+        running_mean = float(np.mean(seed_metrics))
+        trial.report(running_mean, step=n_evals + i + 1)
+
+        if i >= 1 and trial.should_prune():
+            raise optuna.TrialPruned()
+
+    trial.set_user_attr('seed_metrics', seed_metrics)
+    trial.set_user_attr('seed_times_s', seed_times)
+    trial.set_user_attr('total_time_s', float(sum(seed_times)))
+    trial.set_user_attr('mean_metric',  float(np.mean(seed_metrics)))
+    trial.set_user_attr('std_metric',   float(np.std(seed_metrics)))
+
+    return seed_metrics
+
+
+def objective_dqn(trial, seeds, hp):
+    """
+    Optuna objective for DQN hyperparameter search.
+
+    Delegates to run_multi_seed_trial_dqn and returns the mean metric across
+    seeds. Intended to be wrapped in a lambda when passed to study.optimize().
+
+    Parameters
+    ----------
+    trial : optuna.Trial  — current Optuna trial
+    seeds : list[int]     — random seeds to average over for robustness
+    hp    : dict          — hyperparameters built from trial.suggest_* calls;
+                            must include 'n_episodes'
+
+    Returns
+    -------
+    float — mean eval metric across all seeds
+    """
+    seed_metrics = run_multi_seed_trial_dqn(
+        trial      = trial,
+        hp         = hp,
+        seeds      = seeds,
+        n_episodes = hp['n_episodes'],
+    )
+    return float(np.mean(seed_metrics))

@@ -54,6 +54,38 @@ ABLATION_LABELS = [
     'Full clinical',
 ]
 
+#  Factory: compose all three wrappers 
+
+def make_ablation_env(
+    noisy:  bool = True,
+    missing: bool = True,
+    acute:  bool = True,
+    sofa_bias=SOFA_BIAS, lam=LAM,
+    malfunction_prob=0.15, noise_std=0.10,
+    missing_prob=0.15,    n_missing=4,
+    event_prob=0.01,
+):
+    """
+    Configurable environment for ablation studies.
+
+    Each wrapper can be toggled independently:
+        noisy   — EpisodicNoisyObsEnv
+        missing — EpisodicMissingObsEnv
+        acute   — AcuteEventEnv
+
+    Use make_ablation_env(noisy=False, missing=False, acute=False) for
+    the clean baseline and progressively add wrappers to isolate effects.
+    """
+    from envs.continuous_sepsis_env import ContinuousICUSepsisEnv
+
+    env = ContinuousICUSepsisEnv(params=make_sepsis_env(sofa_bias=sofa_bias, lam=lam))
+    if noisy:
+        env = EpisodicNoisyObsEnv(env, malfunction_prob=malfunction_prob, noise_std=noise_std)
+    if missing:
+        env = EpisodicMissingObsEnv(env, missing_prob=missing_prob, n_missing=n_missing)
+    if acute:
+        env = AcuteEventEnv(env, event_prob=event_prob)
+    return env
 
 def train_ppo_ablation(
     condition: dict,
