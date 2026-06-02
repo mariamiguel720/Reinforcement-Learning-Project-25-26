@@ -175,5 +175,3 @@ def make_clinical_env(
     env  = EpisodicMissingObsEnv(env, missing_prob=missing_prob,         n_missing=n_missing)
     env  = AcuteEventEnv(env,          event_prob=event_prob)
     return env
-
-
