@@ -846,3 +846,232 @@ def objective_dqn(trial, seeds, hp):
         n_episodes = hp['n_episodes'],
     )
     return float(np.mean(seed_metrics))
+
+
+
+# -------------------------------------- Double DQN — Network and Training Function --------------------------------------
+
+class QNetworkV2(nn.Module):
+    """
+    Enhanced Q-value approximator for Double DQN.
+
+    Extends the original QNetwork with an additional hidden layer (256-256-128)
+    to increase representational capacity. LayerNorm after each hidden layer
+    stabilises training across the heterogeneous scales of the 47 physiological
+    features, without requiring explicit observation normalisation.
+
+    Compared to QNetwork (two hidden layers of 256 units), the extra 128-unit
+    layer adds a compression stage before the output, encouraging the network
+    to form more abstract representations of the clinical state before
+    mapping to action values.
+
+    Parameters
+    ----------
+    obs_dim   : int — number of input features (default: 47)
+    n_actions : int — number of discrete actions (default: 25)
+    """
+    def __init__(self, obs_dim=OBS_DIM, n_actions=N_ACTIONS):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 256), nn.LayerNorm(256), nn.ReLU(),
+            nn.Linear(256, 256),     nn.LayerNorm(256), nn.ReLU(),
+            nn.Linear(256, 128),     nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, n_actions),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return Q-values for all actions given observation x. Shape: (batch, n_actions)."""
+        return self.net(x)
+
+
+def train_double_dqn(
+    n_episodes      = 100_000,
+    buffer_capacity = 50_000,
+    batch_size      = 32,
+    min_buffer      = 500,
+    lr              = 2.19e-05,
+    grad_clip       = 10.0,
+    eps_start       = 1.0,
+    eps_end         = 0.05,
+    eps_decay       = 0.999285,
+    target_update   = 25,
+    seed            = 42,
+    eval_every      = 1_000,
+    eval_episodes   = 100,
+    save_dir        = None,
+    save_tag        = 'ddqn',
+):
+    """
+    Train a Double DQN agent on the Config B clinical environment.
+
+    Extends the standard DQN training loop with the Double DQN target update,
+    which decouples action selection from action evaluation to reduce
+    overestimation bias. In vanilla DQN, the target network is used for both
+    selecting and evaluating the best next action, systematically overestimating
+    Q-values in stochastic environments. Double DQN instead uses the online
+    network to select the greedy next action and the target network only to
+    evaluate its value, producing less biased Bellman targets and more stable
+    learning in noisy clinical settings.
+
+    All default hyperparameters match the best configuration identified by the
+    Optuna search on the standard DQN, so that any performance difference can
+    be attributed to the algorithmic improvement rather than re-tuning.
+
+    The best checkpoint (highest mean eval return) is restored at the end of
+    training rather than using the final weights, guarding against late-stage
+    instability or regression.
+
+    Parameters
+    ----------
+    n_episodes      : int   — total number of training episodes
+    buffer_capacity : int   — maximum transitions stored in the replay buffer;
+                              oldest transitions are dropped when full
+    batch_size      : int   — number of transitions sampled per gradient step
+    min_buffer      : int   — minimum buffer size before gradient updates begin
+    lr              : float — Adam learning rate (default matches Optuna best)
+    grad_clip       : float — maximum L2 norm for gradient clipping
+    eps_start       : float — starting epsilon for epsilon-greedy exploration
+    eps_end         : float — minimum epsilon (exploration floor)
+    eps_decay       : float — multiplicative decay applied to epsilon each episode
+                              (default matches Optuna best: slow decay, prolonged exploration)
+    target_update   : int   — frequency (in episodes) of hard target-network updates
+    seed            : int   — random seed for reproducibility
+    eval_every      : int   — run a greedy evaluation every N episodes
+    eval_episodes   : int   — number of greedy rollouts per evaluation checkpoint
+    save_dir        : str | None — if provided, best checkpoint and returns are saved here
+    save_tag        : str   — prefix for saved file names
+
+    Returns
+    -------
+    dict with keys:
+        'online'       : QNetworkV2  — trained online network (eval mode, best checkpoint)
+        'best_eval'    : float       — best mean return across all eval checkpoints
+        'best_state'   : dict        — state_dict corresponding to best_eval
+        'eval_history' : list[tuple] — (episode, mean_return) at each checkpoint
+        'returns'      : list[float] — per-episode returns during training
+        'duration_s'   : float       — wall-clock training time in seconds
+    """
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    online = QNetworkV2().to(device)
+    target = QNetworkV2().to(device)
+    target.load_state_dict(online.state_dict())
+    target.eval()
+
+    optimiser  = torch.optim.Adam(online.parameters(), lr=lr)
+    buffer     = ReplayBuffer(buffer_capacity)
+    best_state = {k: v.clone() for k, v in online.state_dict().items()}
+
+    all_returns  = []
+    eval_history = []
+    best_eval    = -float('inf')
+    eps          = eps_start
+    t0           = time.time()
+
+    env      = make_clinical_env()
+    env_eval = make_clinical_env()
+
+    for ep in range(n_episodes):
+        obs, _    = env.reset(seed=int(rng.integers(1_000_000)))
+        ep_return = 0.0
+        done      = False
+
+        while not done:
+            # Epsilon-greedy action selection
+            if random.random() < eps:
+                action = env.action_space.sample()                       # explore
+            else:
+                with torch.no_grad():
+                    obs_t  = torch.FloatTensor(obs).unsqueeze(0).to(device)
+                    action = int(online(obs_t).argmax(1).item())         # exploit
+
+            next_obs, reward, te, tr, _ = env.step(action)
+            done = te or tr
+            buffer.push(obs, action, reward, next_obs, float(done))
+            obs        = next_obs
+            ep_return += reward
+
+            # Gradient update (only once replay buffer is large enough)
+            if len(buffer) >= min_buffer:
+                states, actions, rewards, next_states, dones = buffer.sample(batch_size)
+                states_t      = torch.FloatTensor(states).to(device)
+                actions_t     = torch.LongTensor(actions).to(device)
+                rewards_t     = torch.FloatTensor(rewards).to(device)
+                next_states_t = torch.FloatTensor(next_states).to(device)
+                dones_t       = torch.FloatTensor(dones).to(device)
+
+                # Current Q-values for the actions taken
+                q_values = online(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+
+                # Double DQN target: online selects the next action, target evaluates it.
+                # This breaks the positive feedback loop in vanilla DQN where the same
+                # network both picks and scores the action, leading to overestimation.
+                with torch.no_grad():
+                    next_actions = online(next_states_t).argmax(1)
+                    next_q       = target(next_states_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                    q_target     = rewards_t + GAMMA * next_q * (1 - dones_t)
+
+                loss = nn.MSELoss()(q_values, q_target)
+                optimiser.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(online.parameters(), grad_clip)
+                optimiser.step()
+
+        all_returns.append(ep_return)
+        eps = max(eps_end, eps * eps_decay)
+
+        # Hard update: copy online weights into target network
+        if ep % target_update == 0:
+            target.load_state_dict(online.state_dict())
+
+        # Periodic evaluation checkpoint
+        if (ep + 1) % eval_every == 0 or ep == n_episodes - 1:
+            online.eval()
+            eval_returns = []
+            with torch.no_grad():
+                for _ in range(eval_episodes):
+                    e_obs, _ = env_eval.reset(seed=int(rng.integers(1_000_000)))
+                    e_ret, e_done = 0.0, False
+                    while not e_done:
+                        e_obs_t  = torch.FloatTensor(e_obs).unsqueeze(0).to(device)
+                        e_action = int(online(e_obs_t).argmax(1).item())
+                        e_obs, e_r, e_te, e_tr, _ = env_eval.step(e_action)
+                        e_ret  += e_r
+                        e_done  = e_te or e_tr
+                    eval_returns.append(e_ret)
+            online.train()
+
+            mean_eval = float(np.mean(eval_returns))
+            eval_history.append((ep + 1, mean_eval))
+
+            # Track best checkpoint across the full training run
+            if mean_eval > best_eval:
+                best_eval  = mean_eval
+                best_state = {k: v.clone() for k, v in online.state_dict().items()}
+
+            if (ep + 1) % 10_000 == 0:
+                elapsed = (time.time() - t0) / 60
+                print(f'  ep {ep+1:>6d} | eval {mean_eval:.4f} | best {best_eval:.4f} | eps {eps:.4f} | {elapsed:.1f} min')
+
+    env.close()
+    env_eval.close()
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(best_state, f'{save_dir}/{save_tag}.pth')
+        np.save(f'{save_dir}/{save_tag}_returns.npy', np.array(all_returns))
+        np.save(f'{save_dir}/{save_tag}_eval_history.npy',          
+                np.array(eval_history, dtype=object), allow_pickle=True)
+
+    online.eval()
+    return {
+        'online':       online,
+        'best_eval':    best_eval,
+        'best_state':   best_state,
+        'eval_history': eval_history,
+        'returns':      all_returns,
+        'duration_s':   time.time() - t0,
+    }

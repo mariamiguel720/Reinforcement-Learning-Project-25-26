@@ -471,3 +471,149 @@ def run_multi_seed_trial_ppo(trial, hp, seeds=[42, 123, 7], n_updates=150):
     return seed_metrics
 
 
+def train_ppo(
+    run_id:      int   = 1,
+    n_updates:   int   = 100,
+    n_steps:     int   = 4096,
+    n_epochs:    int   = 10,
+    batch_size:  int   = 256,
+    lr:          float = 3e-4,
+    clip:        float = 0.2,
+    gae_lam:     float = 0.95,
+    ent_coef:    float = 0.01,
+    vf_coef:     float = 0.5,
+    max_grad:    float = 0.5,
+    save_dir:    str   = 'models',
+):
+    """
+    Train a PPO agent on the Config B clinical environment.
+
+    Saves model weights and episode returns to `save_dir` at the end of
+    training so results survive session restarts.
+
+    Parameters:
+        - run_id     : integer label used in saved file names
+                    (ppo_run{run_id}.pth, ppo_returns_run{run_id}.npy)
+        - n_updates  : total number of rollout/update cycles
+        - n_steps    : environment steps collected per rollout
+        - n_epochs   : gradient epochs per update (reuse of each rollout)
+        - batch_size : mini-batch size within each epoch
+        - lr         : Adam learning rate (eps fixed at 1e-5 as standard for PPO)
+        - clip       : PPO clipping epsilon
+        - gae_lam    : GAE lambda — controls bias/variance trade-off
+        - ent_coef   : entropy bonus coefficient (encourages exploration)
+        - vf_coef    : value function loss coefficient
+        - max_grad   : maximum L2 norm for gradient clipping
+        - save_dir   : directory where weights and arrays are saved
+
+    Returns:
+        - dict with keys:
+            'model'       : trained ActorCritic (in eval mode)
+            'returns'     : list[float]  per-episode returns
+            'train_time'  : float        wall-clock training time in seconds
+            'run_id'      : int          the run_id passed in
+    """
+
+    model     = ActorCritic().to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    buffer    = RolloutBuffer()
+
+    all_returns = []
+    t0          = time.time()
+
+    env = make_sepsis_env()
+    obs, _ = env.reset(seed=SEED)
+
+    ep_return          = 0.0
+    current_ep_returns = []
+
+    for update in range(n_updates):
+
+        buffer.clear()
+
+        for step in range(n_steps):
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                action, log_prob, value = model.get_action(obs_t)
+
+            next_obs, reward, te, tr, _ = env.step(action.item())
+            done = te or tr
+
+            buffer.push(obs, action.item(), reward, float(done),
+                        log_prob.item(), value)
+
+            ep_return += reward
+            obs        = next_obs
+
+            if done:
+                all_returns.append(ep_return)
+                current_ep_returns.append(ep_return)
+                ep_return = 0.0
+                obs, _ = env.reset(seed=np.random.randint(100_000))
+
+        advantages  = compute_gae(buffer.rewards, buffer.values, buffer.dones, lam=gae_lam)
+        advantages  = torch.FloatTensor(advantages).to(device)
+        advantages  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        returns_gae = advantages + torch.FloatTensor(
+            [v.item() for v in buffer.values]).to(device)
+
+        states_t  = torch.FloatTensor(np.array(buffer.states)).to(device)
+        actions_t = torch.LongTensor(buffer.actions).to(device)
+        old_lp_t  = torch.FloatTensor(buffer.log_probs).to(device)
+
+        indices = np.arange(n_steps)
+
+        for epoch in range(n_epochs):
+            np.random.shuffle(indices)
+
+            for start in range(0, n_steps, batch_size):
+                idx = indices[start:start + batch_size]
+
+                log_prob, value, entropy = model.evaluate(states_t[idx], actions_t[idx])
+
+                ratio        = torch.exp(log_prob - old_lp_t[idx])
+                surr1        = ratio * advantages[idx]
+                surr2        = torch.clamp(ratio, 1 - clip, 1 + clip) * advantages[idx]
+                actor_loss   = -torch.min(surr1, surr2).mean()
+                critic_loss  =  F.mse_loss(value, returns_gae[idx])
+                entropy_loss = -entropy.mean()
+
+                loss = actor_loss + vf_coef * critic_loss + ent_coef * entropy_loss
+
+                optimiser.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+                optimiser.step()
+
+        mean_ret           = np.mean(current_ep_returns) if current_ep_returns else 0.0
+        current_ep_returns = []
+        print(
+            f'[Run {run_id}] Update {update+1:3d}/{n_updates} | '
+            f'Episodes: {len(all_returns):5d} | '
+            f'Mean return: {mean_ret:.4f}'
+        )
+
+    env.close()
+    train_time = time.time() - t0
+
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(model.state_dict(),                      f'{save_dir}/ppo_run{run_id}.pth')
+    np.save(f'{save_dir}/ppo_returns_run{run_id}.npy',  np.array(all_returns))
+
+    model.eval()
+    print(f'\nTraining complete in {train_time:.1f}s')
+    print(f'Total episodes:             {len(all_returns):,}')
+    if len(all_returns) >= 1000:
+        print(f'Mean return (last 1000 ep): {np.mean(all_returns[-1000:]):.4f}')
+    print(f'Saved → {save_dir}/ppo_run{run_id}.*')
+
+    return {
+        'model':      model,
+        'returns':    all_returns,
+        'train_time': train_time,
+        'run_id':     run_id,
+    }
+
+

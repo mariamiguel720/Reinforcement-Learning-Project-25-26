@@ -133,7 +133,7 @@ def evaluate(model, env_fn, n_episodes=1000, is_ppo=False, is_sac=False, label='
 
 def plot_learning_curve(returns, label, window=200, trend=True):
     """Learning curve with smoothed returns and optional linear trend line."""
-    fig, ax = plt.subplots(figsize=(12, 4))
+    fig, ax = plt.subplots(figsize=(12, 6))
 
     returns = np.asarray(returns)
     smoothed = pd.Series(returns).rolling(window).mean()
@@ -149,7 +149,7 @@ def plot_learning_curve(returns, label, window=200, trend=True):
 
     # Eixo y apertado a volta da curva suavizada (ignora NaNs iniciais da rolling)
     valid = smoothed.dropna()
-    margin = (valid.max() - valid.min()) * 0.1
+    margin = (valid.max() - valid.min()) * 0.01
     ax.set_ylim(valid.min() - margin, valid.max() + margin)
 
     ax.set_xlabel('Episode')
@@ -158,7 +158,6 @@ def plot_learning_curve(returns, label, window=200, trend=True):
     ax.legend()
     plt.tight_layout()
     plt.show()
-
 
 def survival_ci(returns, confidence=0.95):
     """Confidence interval for survival rate."""
@@ -204,3 +203,97 @@ def plot_episode_type_comparison(noisy, clean, missing, label, baseline=None):
 
     plt.tight_layout()
     plt.show()
+
+
+
+def analyse_seed_results(
+    seeds:      list,
+    load_fn,
+    colors:     dict = None,
+    window:     int  = 1000,
+    title:      str  = 'Learning curves per seed',
+):
+    """
+    Load, compute metrics, and plot learning curves for a multi-seed training run.
+
+    Designed to work with any algorithm that saves per-seed returns and eval
+    history arrays (DQN, Double DQN, PPO, SAC). The loading logic is delegated
+    to `load_fn` to keep this function algorithm-agnostic.
+
+    Parameters
+    ----------
+    seeds   : list[int] — random seeds to analyse
+    load_fn : callable(seed) -> dict with keys:
+                  'returns'   : np.ndarray — per-episode returns
+                  'eval_vals' : list[float] — eval checkpoint values
+              Called once per seed to load the relevant arrays from disk.
+    colors  : dict[int, str] | None — mapping seed -> hex colour for the plot;
+              defaults to a blue palette if None
+    window  : int — smoothing window for the learning curve (default: 1000)
+    title   : str — suptitle for the plot
+
+    Returns
+    -------
+    dict[int, dict] — per-seed metrics:
+        'eval_vals' : list[float] — eval checkpoint values
+        'returns'   : np.ndarray — per-episode returns
+        'best_eval' : float      — maximum eval value across checkpoints
+        'growth'    : float      — last eval minus first eval
+        'std_eval'  : float      — standard deviation of eval values
+        'slope'     : float      — linear trend slope over all training episodes
+        'intercept' : float      — linear trend intercept
+    """
+    if colors is None:
+        default_palette = ['#1a5f8a', '#2f94d7', '#a8d4f0']
+        colors = {s: c for s, c in zip(seeds, default_palette)}
+
+    seed_results = {}
+    for seed in seeds:
+        data      = load_fn(seed)
+        ret       = data['returns']
+        eval_vals = data['eval_vals']
+        x         = np.arange(len(ret))
+        slope, intercept = np.polyfit(x, ret, 1)
+        seed_results[seed] = {
+            'eval_vals': eval_vals,
+            'returns':   ret,
+            'best_eval': max(eval_vals),
+            'growth':    eval_vals[-1] - eval_vals[0],
+            'std_eval':  float(np.std(eval_vals)),
+            'slope':     slope,
+            'intercept': intercept,
+        }
+
+    # Metrics table
+    df_display = pd.DataFrame([
+        {'seed': s, 'best_eval': round(r['best_eval'], 4),
+         'growth': round(r['growth'], 4), 'std_eval': round(r['std_eval'], 4),
+         'slope': f"{r['slope']:.2e}"}
+        for s, r in seed_results.items()
+    ]).set_index('seed')
+    print(df_display)
+
+    # Learning curves
+    fig, axes = plt.subplots(1, len(seeds), figsize=(6 * len(seeds), 5), sharey=True)
+    if len(seeds) == 1:
+        axes = [axes]
+
+    for ax, seed in zip(axes, seeds):
+        r        = seed_results[seed]
+        smoothed = pd.Series(r['returns']).rolling(window).mean().values
+        x        = np.arange(len(r['returns']))
+        ax.plot(smoothed, color=colors[seed], linewidth=1.5,
+                label=f'Smoothed (window={window})')
+        ax.plot(x, r['slope'] * x + r['intercept'], color='#0a1f35',
+                linewidth=1.5, linestyle='--', label=f'Trend (slope={r["slope"]:.2e})')
+        ax.set_title(f'Seed {seed}  —  best eval={r["best_eval"]:.4f}', fontweight='bold')
+        ax.set_xlabel('Training episode')
+        ax.set_ylabel('Return')
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.3)
+
+    plt.suptitle(title, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+    return seed_results

@@ -432,7 +432,9 @@ def compute_shap_policy(model, obs_data, n_background=100, n_explain=200, seed=4
 
     if isinstance(sv, list):
         sv = sv[0]
-    sv    = np.array(sv)
+    sv = np.array(sv).squeeze()          # ensure shape (n_explain, 47)
+    if sv.ndim == 1:
+        sv = sv.reshape(1, -1)
     order = np.argsort(np.abs(sv).mean(axis=0).flatten())[::-1]
 
     print(f'Policy SHAP computed — {n_explain} observations explained.')
@@ -459,7 +461,9 @@ def compute_shap_value(model, obs_data, n_background=100, n_explain=200, seed=42
 
     if isinstance(sv, list):
         sv = sv[0]
-    sv    = np.array(sv)
+    sv = np.array(sv).squeeze()          # ensure shape (n_explain, 47)
+    if sv.ndim == 1:
+        sv = sv.reshape(1, -1)
     order = np.argsort(np.abs(sv).mean(axis=0).flatten())[::-1]
 
     print(f'Value SHAP computed — {n_explain} observations explained.')
