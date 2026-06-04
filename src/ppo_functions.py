@@ -18,16 +18,10 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # Project modules
-from envs.env_setup import (
-    ENV_ID, N_STATES, N_ACTIONS, STATE_SURVIVED, STATE_DIED,
-    GAMMA, INTENSITY, SOFA_BIAS, LAM,
-    make_sepsis_env,
-)
-from envs.continuous_sepsis_env import ContinuousICUSepsisEnv, FEATURE_NAMES
-from envs.wrappers import (
-    EpisodicNoisyObsEnv, EpisodicMissingObsEnv,
-    AcuteEventEnv, make_clinical_env
-)
+from envs.env_setup import *
+from envs.continuous_sepsis_env import *
+from envs.wrappers import *
+from src.creative_extension import *
 
 
 

@@ -22,7 +22,7 @@ import shap
 
 from src.ppo_functions import *
 
-from envs.wrappers import make_clinical_env
+from src.creative_extension import *
 from envs.continuous_sepsis_env import FEATURE_NAMES
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
