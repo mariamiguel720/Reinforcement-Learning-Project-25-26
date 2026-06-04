@@ -515,7 +515,7 @@ def train_ppo(
     all_returns = []
     t0          = time.time()
 
-    env = make_sepsis_env()
+    env = make_clinical_env()
     obs, _ = env.reset(seed=SEED)
 
     ep_return          = 0.0
