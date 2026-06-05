@@ -9,6 +9,7 @@ The work is divided into two configurations:
 
 ## Project Structure
 
+```
 ├── RL Config_A.ipynb          # Config A notebook — tabular methods (Q-Learning, Dyna-Q)
 ├── RL_Config_B.ipynb          # Config B notebook — deep RL methods (DQN, Double DQN, PPO)
 ├── Extra_Models.ipynb         # Additional experiments (SAC and other exploratory models)
@@ -36,6 +37,7 @@ The work is divided into two configurations:
 └── figures/                   # Saved plots
     ├── config_A/              # Learning curves and results for Config A
     └── config_B/              # Learning curves and results for Config B
+```
 
 
 Each notebook runs end-to-end: environment exploration -> random baseline -> initial training -> Optuna hyperparameter tuning -> final retraining across 3 seeds -> comparative evaluation. Model checkpoints and results are saved to `models/` so training does not need to be repeated between sessions.
