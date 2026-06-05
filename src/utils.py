@@ -108,7 +108,7 @@ def evaluate(model, env_fn, n_episodes=1000, is_ppo=False, is_sac=False, label='
     print(f'  Mean return            : {np.mean(returns):.4f}')
     print(f'  Mean episode length    : {np.mean(lengths):.1f} steps')
     if baseline is not None:
-        print(f'  vs Random baseline     : {survival - baseline*100:+.1f}pp')
+        print(f'  vs Random baseline     : {survival - baseline:+.1f}pp')
     print(f'─' * 52)
     print(f'  Noisy episodes   ({len(noisy_r):3d}): {np.mean(np.array(noisy_r)>0)*100:.1f}% survival')
     print(f'  Clean episodes   ({len(clean_r):3d}): {np.mean(np.array(clean_r)>0)*100:.1f}% survival')

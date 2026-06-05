@@ -270,6 +270,7 @@ def run_ablation_study(
     return df
 
 
+
 def plot_ablation_results(df_ablation, baseline_survival=None):
     """
     Bar chart of survival rate for each ablation condition.
@@ -283,14 +284,14 @@ def plot_ablation_results(df_ablation, baseline_survival=None):
     colors = []
     for _, row in df_ablation.iterrows():
         n_wrappers = int(row['noisy']) + int(row['missing']) + int(row['acute'])
-        palette = ['#2f94d7', '#f0a500', '#e06c2f', '#c0392b']
+        palette = ['#1A3A5C', '#2E6DA4', '#4A90C4', '#9BBDD4']
         colors.append(palette[n_wrappers])
 
     fig, ax = plt.subplots(figsize=(13, 5))
     x = np.arange(len(labels))
     bars = ax.bar(x, [m * 100 for m in means],
                   yerr=[s * 100 for s in stds],
-                  color=colors, width=0.6, capsize=5,
+                  color=colors, width=0.6, capsize=6,
                   error_kw={'ecolor': 'black', 'linewidth': 1.2})
 
     for bar, m, s in zip(bars, means, stds):
@@ -306,14 +307,14 @@ def plot_ablation_results(df_ablation, baseline_survival=None):
                    color='#0a1f35', linestyle='--', linewidth=1.4,
                    label='Clean baseline')
 
-    ax.axhline(clinical_rand_mean * 100, color='grey',
+    ax.axhline(clinical_mean_return * 100, color='grey',
                linestyle=':', linewidth=1.2, label='Random baseline')
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=9)
+    ax.set_xticklabels(labels, rotation=20, ha='right', fontsize=10.5)
     ax.set_ylabel('Survival Rate (%)')
     ax.set_title('PPO Ablation Study — Impact of Clinical Reality Wrappers', fontweight='bold')
-    ax.set_ylim(0, 100)
+    ax.set_ylim(50, 80)
     ax.legend()
     plt.tight_layout()
     plt.show()
@@ -346,7 +347,7 @@ def print_ablation_summary(df_ablation):
 
     # Check additivity: noisy+missing vs noisy_only + missing_only
     def get(cond): return df_ablation.loc[df_ablation['condition'] == cond, 'mean_survival'].values[0]
-    additive_nm  = (get('Noisy only') + get('Missing only') - baseline) * 100
+    additive_nm = (get('Noisy only') + get('Missing only') - 2*baseline) * 100
     actual_nm    = (get('Noisy + Missing') - baseline) * 100
     interaction  = actual_nm - additive_nm
 
